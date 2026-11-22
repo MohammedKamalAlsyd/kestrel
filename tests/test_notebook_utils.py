@@ -35,7 +35,7 @@ def test_resolve_asset_source_falls_back_to_github_raw(tmp_path: Path):
     )
     assert origin == "github"
     assert loc == (
-        "https://raw.githubusercontent.com/MohammedKamalAlsyd/kestrel/main/"
+        "https://raw.githubusercontent.com/MohammedKamalAlsyd/kestrel/master/"
         "docs/images/missing_chart.gif"
     )
 
@@ -48,7 +48,7 @@ def test_build_explainer_html_local_and_github(tmp_path: Path):
         repo_root=tmp_path,
     )
     assert origin == "github"
-    assert loc.startswith("https://raw.githubusercontent.com/MohammedKamalAlsyd/kestrel/main/")
+    assert loc.startswith("https://raw.githubusercontent.com/MohammedKamalAlsyd/kestrel/master/")
     assert f'src="{loc}"' in remote_html
     assert "Pipeline Overview" in remote_html
 

@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Sequence
 
 DEFAULT_REPO_URL = "https://github.com/MohammedKamalAlsyd/kestrel.git"
-DEFAULT_BRANCH = "main"
+DEFAULT_BRANCH = "master"
 DEFAULT_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/MohammedKamalAlsyd/kestrel/{DEFAULT_BRANCH}"
 )
@@ -68,14 +68,15 @@ def find_repo_root(extra_candidates: Sequence[str | Path] | None = None) -> Path
 
 def ensure_kestrel_repo(
     repo_url: str = DEFAULT_REPO_URL,
-    branch: str = DEFAULT_BRANCH,
+    branch: str | None = None,
     work_dir: str | Path | None = None,
     update_if_exists: bool = False,
 ) -> Path | None:
     """Ensure the Kestrel repository is available locally and `src/` is on `sys.path`.
 
     Checks local/Kaggle paths first; if missing, performs a shallow `git clone` into
-    `<work_dir>/kestrel`. Returns the repository root or `None` if cloning fails.
+    `<work_dir>/kestrel`. When ``branch`` is ``None``, Git clones the remote's default
+    branch (e.g. ``master`` or ``main``). Returns the repository root or ``None``.
     """
     repo_root = find_repo_root()
     if repo_root is None:
@@ -86,18 +87,11 @@ def ensure_kestrel_repo(
                 if update_if_exists:
                     subprocess.check_call(["git", "-C", str(clone_dir), "pull", "--ff-only"])
             else:
-                subprocess.check_call(
-                    [
-                        "git",
-                        "clone",
-                        "--depth",
-                        "1",
-                        "--branch",
-                        branch,
-                        repo_url,
-                        str(clone_dir),
-                    ]
-                )
+                cmd = ["git", "clone", "--depth", "1"]
+                if branch:
+                    cmd.extend(["--branch", branch])
+                cmd.extend([repo_url, str(clone_dir)])
+                subprocess.check_call(cmd)
             if (clone_dir / "src" / "kestrel").is_dir():
                 repo_root = clone_dir
         except Exception:
