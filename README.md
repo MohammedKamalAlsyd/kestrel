@@ -6,7 +6,7 @@
 
 ![Kestrel Data Selection Pipeline](docs/images/01_kestrel_data_pipeline.png)
 
-- **Reusable Diagnostics Module:** [`src/kestrel/data/diagnostics.py`](src/kestrel/data/diagnostics.py) — equal-token streaming (`tiktoken` `gpt2`), stratified content vs. function word-transition networks & conditional entropy, document-level LZ4 Goldilocks (`0.65–0.80`) compression & Gopher/FineWeb 2–10-gram repetition, OpenWebText & benchmark JSD/Jaccard alignment, and exact 13-gram contamination checks.
+- **Reusable Diagnostics Module:** [`src/kestrel/data/diagnostics.py`](src/kestrel/data/diagnostics.py) — multi-shard randomized streaming & constant-RAM full-stream aggregation (`tiktoken` `gpt2`), document-level LZ4 Goldilocks (`0.65–0.80`) compression, Gopher/FineWeb 2–10-gram repetition & cross-doc 7-gram boilerplate, OpenWebText & benchmark JSD/coverage alignment, and exact 13-gram contamination checks.
 - **Kaggle-Ready Interactive Audit Notebook:** [`notebooks/01_dataset_audit.ipynb`](notebooks/01_dataset_audit.ipynb) — self-contained with beginner-friendly explanations, explanatory diagrams, animated walkthroughs, and automatic GitHub repo sync on Kaggle (`git clone --depth 1 https://github.com/MohammedKamalAlsyd/kestrel.git`).
 - **Mixture Justification Report:** [`docs/dataset_justification.md`](docs/dataset_justification.md) — full comparison of all 6 audited corpora (`FineWeb-Edu`, `DCLM-Baseline 1.0`, `Nemotron-CC v2.1`, `Nemotron-ClimbMix`, `FinePDFs-Edu`, `OpenWebText` control) and exact Stage-1 (90%) + Stage-2 Annealing (10%) mixture ratios.
 

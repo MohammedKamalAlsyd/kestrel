@@ -6,41 +6,56 @@ import math
 import zlib
 from unittest.mock import patch
 
-import networkx as nx
-import pytest
-
 from kestrel.data import diagnostics as diag
 
 
-def test_stratified_transition_network_detects_left_and_right_tail_noise():
-    # Left-tail boilerplate: "policy privacy" repeats relentlessly
-    boilerplate_docs = [
-        "Our policy privacy notice states that policy privacy rules protect every user."
-        for _ in range(40)
+class _FakeShardedIterable:
+    """Minimal mock of a multi-shard Hugging Face IterableDataset."""
+
+    def __init__(self, shards: list[list[dict]], active_shard: int | None = None):
+        self._shards = shards
+        self._active = active_shard
+        self.n_shards = len(shards) if active_shard is None else 1
+
+    def shard(self, num_shards: int, index: int, contiguous: bool = True):
+        assert num_shards == len(self._shards)
+        return _FakeShardedIterable(self._shards, active_shard=index)
+
+    def shuffle(self, seed=None, buffer_size: int = 1000):
+        import random
+
+        rows = list(self)
+        random.Random(seed).shuffle(rows)
+        return _FakeShardedIterable([rows], active_shard=0)
+
+    def __iter__(self):
+        if self._active is not None:
+            return iter(self._shards[self._active])
+        return (r for s in self._shards for r in s)
+
+
+def test_cross_doc_boilerplate_catches_recurring_footers_missed_by_single_doc():
+    footer = "subscribe to our free daily newsletter for exclusive deals"
+    docs = [
+        f"Unique technical essay number {i} about turbine thermodynamics and heat transfer. {footer}"
+        for i in range(25)
     ]
-    left_res = diag.audit_transition_network(boilerplate_docs)
-    policy_stats = left_res["content"]["per_word"]["policy"]
-    assert policy_stats["top1_mass"] > 0.9
-    assert policy_stats["left_tail_flag"] is True
-    assert "policy" in left_res["content"]["left_tail_flagged_words"]
-    assert left_res["boilerplate"]["cross_doc_boilerplate_doc_rate"] > 0.9
+    res = diag.audit_cross_doc_boilerplate(docs, cross_doc_min_docs=10)
+    assert res["cross_doc_boilerplate_doc_rate"] == 1.0
+    assert any("subscribe to our free daily newsletter" in ng for ng, _ in res["top_cross_doc_ngrams"])
 
-    # Right-tail broken scrape: "system" followed by 40 completely distinct random tokens
-    unique_followers = [f"tok{chr(97 + i // 26)}{chr(97 + i % 26)}x" for i in range(60)]
-    scattered_docs = [" ".join(f"system {w}" for w in unique_followers)]
-    right_res = diag.audit_transition_network(scattered_docs)
-    sys_stats = right_res["content"]["per_word"]["system"]
-    assert sys_stats["out_degree"] == 60
-    assert sys_stats["normalized_entropy"] > 0.99
-    assert sys_stats["singleton_ratio"] == 1.0
-    assert sys_stats["right_tail_flag"] is True
-    assert "system" in right_res["content"]["right_tail_flagged_words"]
-
-    # Build NetworkX DiGraph check
-    g = diag.build_transition_digraph(left_res, "policy", stratum="content", top_k=5)
-    assert isinstance(g, nx.DiGraph)
-    assert g.has_edge("policy", "privacy")
-    assert g["policy"]["privacy"]["weight"] > 0.9
+    topics = [
+        "planetary atmospheres", "ocean currents", "volcanic geology", "cellular respiration",
+        "bridge engineering", "quantum optics", "ancient trade routes", "compiler design",
+        "battery chemistry", "coral ecosystems", "glacial erosion", "urban transit",
+    ]
+    verbs = ["measure", "analyze", "compare", "document", "simulate", "verify"]
+    clean_docs = [
+        f"Report on {topics[i % len(topics)]} where teams {verbs[i % len(verbs)]} distinct findings for cohort {chr(65 + i)}."
+        for i in range(25)
+    ]
+    clean_res = diag.audit_cross_doc_boilerplate(clean_docs, cross_doc_min_docs=10)
+    assert clean_res["cross_doc_boilerplate_doc_rate"] == 0.0
 
 
 def test_gopher_repetition_rates_flags_repetitive_but_not_clean_prose():
@@ -108,8 +123,74 @@ def test_13gram_contamination_distinguishes_overlap_from_clean():
     assert len(leaked_res["sample_matches"]) >= 1
 
 
+def test_multi_shard_random_sampling_avoids_prefix_bias(tmp_path):
+    # 10 shards, each tagged with its shard number; prefix-only sampling would only see shard_0!
+    shards = [
+        [
+            {"text": f"shard_{s} document {j} with enough text to pass the minimum length threshold easily."}
+            for j in range(10)
+        ]
+        for s in range(10)
+    ]
+    fake_ds = _FakeShardedIterable(shards)
+    spec = diag.DatasetSpec(key="mock", display_name="Mock", repo_id="mock/repo")
+
+    with (
+        patch.object(diag, "_load_hf_iterable", return_value=fake_ds),
+        patch.object(diag, "get_gpt2_tokenizer", return_value=None),
+        patch.object(diag, "count_gpt2_tokens", side_effect=lambda txt, enc=None: len(txt.split())),
+    ):
+        recs = diag.stream_matched_slice(
+            spec=spec,
+            cache_path=tmp_path / "mock.jsonl",
+            target_tokens=10_000,
+            max_docs=20,
+            random_sample=True,
+            num_shards_to_sample=5,
+            shuffle_buffer_size=50,
+            seed=42,
+        )
+
+    seen_shards = {r["text"].split()[0] for r in recs}
+    assert len(recs) == 20
+    assert len(seen_shards) == 5  # sampled evenly across 5 distinct shards, not just shard_0!
+
+
+def test_stream_aggregate_audit_runs_constant_ram_pass():
+    def fake_lz4_ratio(text: str) -> float:
+        raw = text.encode("utf-8")
+        return len(zlib.compress(raw, level=1)) / max(len(raw), 1)
+
+    eval_idx = {
+        "arc_easy": diag.build_eval_ngram_index(
+            ["A student pours warm water into a graduated cylinder and measures the final temperature carefully."]
+        )
+    }
+    rows = [
+        {
+            "text": "Thermodynamics studies heat transfer and mechanical work across clean physical systems in laboratories.",
+            "n_tokens": 18,
+        },
+        {
+            "text": "Exam leak: A student pours warm water into a graduated cylinder and measures the final temperature carefully.",
+            "n_tokens": 22,
+        },
+    ]
+    spec = diag.DatasetSpec(key="stream_mock", display_name="Stream Mock", repo_id="mock/stream")
+    with patch.object(diag, "compute_lz4_ratio", side_effect=fake_lz4_ratio):
+        res = diag.stream_aggregate_audit(
+            spec=spec,
+            eval_ngram_indices=eval_idx,
+            row_stream=iter(rows),
+        )
+
+    assert res["n_docs"] == 2
+    assert res["total_tokens"] == 40
+    assert res["contamination"]["arc_easy"]["contaminated_candidate_docs"] == 1
+    assert res["contamination"]["arc_easy"]["eval_contamination_rate"] == 1.0
+
+
 def test_run_full_audit_and_scorecard_end_to_end():
-    # Mock LZ4 ratio deterministically if lz4 isn't installed in the local test env
     def fake_lz4_ratio(text: str) -> float:
         raw = text.encode("utf-8")
         return len(zlib.compress(raw, level=1)) / max(len(raw), 1)
@@ -160,3 +241,5 @@ def test_run_full_audit_and_scorecard_end_to_end():
     assert list(scorecard["Rank"]) == [1, 2, 3]
     assert scorecard.iloc[-1]["Key"] == "noisy_scrape"
     assert scorecard.iloc[0]["Composite Score"] > scorecard.iloc[-1]["Composite Score"]
+    assert "Vocab Entropy (bits)" not in scorecard.columns
+    assert "Within-Doc Loop (%)" not in scorecard.columns
