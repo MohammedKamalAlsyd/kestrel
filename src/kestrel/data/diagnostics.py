@@ -2,10 +2,8 @@
 
 Provides multi-shard randomized streaming and constant-RAM full-stream aggregation
 alongside three core non-overlapping diagnostic pillars:
-1. Document-level LZ4 compression ("Goldilocks band" 0.65-0.80), Gopher/FineWeb
-   within-document n-gram repetition (n=2..10), and cross-document 7-gram boilerplate.
-2. GPT-2 & evaluation benchmark domain alignment (unigram/bigram JSD, common-word
-   coverage, Top-10k Jaccard).
+1. Gopher/FineWeb within-document n-gram repetition (n=2..10) & cross-document 7-gram boilerplate.
+2. GPT-2 & evaluation benchmark domain alignment (Unigram/Bigram JSD & Top-10k Jaccard).
 3. 13-gram exact-overlap contamination detection against evaluation test splits.
 """
 
@@ -35,17 +33,9 @@ from kestrel.utils.text import (
     normalize_words,
 )
 
-try:
-    import lz4.block
-    import lz4.frame
-except ImportError:  # pragma: no cover - installed on Kaggle / via extras
-    lz4 = None  # type: ignore[assignment]
-
 # ---------------------------------------------------------------------------
 # Constants & Thresholds
 # ---------------------------------------------------------------------------
-
-GOLDILOCKS_LZ4_BAND: tuple[float, float] = (0.65, 0.80)
 
 # Gopher / FineWeb repetition thresholds (Rae et al., 2021; Penedo et al., 2024).
 GOPHER_TOP_NGRAM_THRESHOLDS: dict[int, float] = {
@@ -301,7 +291,6 @@ def _load_hf_iterable(spec: DatasetSpec, hf_token: str | None = None) -> Any:
                 ds = load_dataset(attempt["repo_id"], config, **kwargs)
             else:
                 ds = load_dataset(attempt["repo_id"], **kwargs)
-            # Eagerly verify first row so gated-auth / schema / legacy-script errors trigger fallbacks.
             _ = next(iter(ds))
             return ds
         except Exception as exc:  # pragma: no cover - network/HF runtime dependent
@@ -324,17 +313,7 @@ def iter_randomized_shards(
     shuffle_buffer_size: int = 2_000,
     seed: int = 42,
 ) -> Iterator[tuple[int, Iterator[dict[str, Any]]]]:
-    """Yield `(shard_quota_idx, row_iterator)` streams distributed across remote shards.
-
-    When ``random_sample=True`` and ``ds.n_shards > 1``:
-    - Picks ``K = min(num_shards_to_sample, ds.n_shards)`` distinct remote shards
-      uniformly at random across the entire multi-terabyte dataset.
-    - Applies a per-shard reservoir shuffle buffer (``shuffle_buffer_size``) so we
-      avoid both single-shard bias and opening-row prefix bias.
-
-    When ``random_sample=False`` (e.g., full-dataset sequential streaming aggregation),
-    yields a single full-dataset iterator.
-    """
+    """Yield `(shard_quota_idx, row_iterator)` streams distributed across remote shards."""
     if not random_sample:
         yield (0, iter(ds))
         return
@@ -352,7 +331,6 @@ def iter_randomized_shards(
             yield (pos, iter(shard_ds))
         return
 
-    # Single-shard or full-stream random shuffle fallback
     shuffled = (
         ds.shuffle(seed=seed, buffer_size=shuffle_buffer_size)
         if shuffle_buffer_size > 1 and hasattr(ds, "shuffle")
@@ -374,12 +352,7 @@ def stream_matched_slice(
     shuffle_buffer_size: int = 2_000,
     seed: int = 42,
 ) -> list[dict[str, Any]]:
-    """Stream an equal-sized, multi-shard randomly sampled GPT-2 token slice to JSONL.
-
-    Instead of taking only the opening prefix of shard 0 (which introduces domain/date
-    prefix bias), draws evenly across ``num_shards_to_sample`` randomly selected shards
-    spanning the entire dataset, with a per-shard shuffle buffer.
-    """
+    """Stream an equal-sized, multi-shard randomly sampled GPT-2 token slice to JSONL."""
     cache_file = Path(cache_path)
     if cache_file.exists() and not force_refresh:
         return load_jsonl_slice(cache_file)
@@ -415,7 +388,6 @@ def stream_matched_slice(
             if remaining_tokens == 0 or remaining_docs == 0:
                 break
 
-            # Fair per-shard quota (any shortfall automatically rolls into remaining shards)
             shard_token_quota = math.ceil(remaining_tokens / remaining_shards)
             shard_doc_quota = math.ceil(remaining_docs / remaining_shards)
             shard_tokens = 0
@@ -541,24 +513,8 @@ def load_eval_benchmark_texts(
 
 
 # ---------------------------------------------------------------------------
-# 1. Compression (LZ4), Gopher Repetition & Cross-Doc Boilerplate Audit
+# 1. Gopher Repetition & Cross-Doc 7-Gram Boilerplate Audit
 # ---------------------------------------------------------------------------
-
-
-def compute_lz4_ratio(text: str) -> float:
-    """Compute LZ4 compression ratio (compressed_bytes / raw_bytes) without header bloat."""
-    if lz4 is None:
-        raise ImportError(
-            "lz4 is required for compression-ratio audits. Install with: pip install lz4"
-        )
-    raw = text.encode("utf-8", errors="ignore")
-    if not raw:
-        return 0.0
-    try:
-        compressed = lz4.block.compress(raw, store_size=False)
-    except Exception:
-        compressed = lz4.frame.compress(raw)
-    return float(len(compressed) / len(raw))
 
 
 def _merged_span_char_length(
@@ -589,12 +545,7 @@ def _merged_span_char_length(
 
 
 def compute_gopher_repetition_rates(text: str) -> dict[str, Any]:
-    """Compute Gopher / FineWeb within-document n-gram repetition metrics (n=2..10).
-
-    - For n in {2, 3, 4}: fraction of characters covered by the single most frequent repeated n-gram.
-    - For n in {5..10}: fraction of characters covered by all n-grams occurring >= 2 times.
-    - ``gopher_flagged``: True if any metric exceeds Gopher/FineWeb thresholds.
-    """
+    """Compute Gopher / FineWeb within-document n-gram repetition metrics (n=2..10)."""
     words = normalize_alnum_words(text)
     n_words = len(words)
     if n_words < 2:
@@ -662,11 +613,7 @@ def audit_cross_doc_boilerplate(
     min_doc_fraction: float = 0.005,
     top_k: int = 10,
 ) -> dict[str, Any]:
-    """Detect site-wide boilerplate 7-grams repeating across distinct documents.
-
-    Catches recurring cookie banners, copyright footers, and scraped menus that appear
-    once per page (and therefore pass single-document LZ4 and Gopher filters).
-    """
+    """Detect site-wide boilerplate 7-grams repeating across distinct documents."""
     n_docs = len(texts)
     if n_docs == 0:
         return {
@@ -699,37 +646,19 @@ def audit_cross_doc_boilerplate(
     }
 
 
-def audit_compression_and_repetition(
+def audit_repetition_and_boilerplate(
     texts: Sequence[str],
-    goldilocks_band: tuple[float, float] = GOLDILOCKS_LZ4_BAND,
     max_rep_docs: int | None = None,
 ) -> dict[str, Any]:
-    """Run document-level LZ4 compression, Gopher repetition, and cross-doc boilerplate audit."""
+    """Run length-normalized Gopher repetition and cross-document 7-gram boilerplate audit."""
     if not texts:
         return {
             "n_docs": 0,
-            "lz4_ratios": [],
-            "lz4_mean": 0.0,
-            "lz4_median": 0.0,
-            "lz4_std": 0.0,
-            "lz4_p05": 0.0,
-            "lz4_p95": 0.0,
-            "lz4_below_band_rate": 0.0,
-            "lz4_in_band_rate": 0.0,
-            "lz4_above_band_rate": 0.0,
-            "lz4_out_of_band_rate": 0.0,
             "gopher_mean_rates": {},
             "gopher_flag_rate": 0.0,
             "cross_doc_boilerplate_doc_rate": 0.0,
             "top_cross_doc_ngrams": [],
         }
-
-    lo, hi = goldilocks_band
-    ratios = np.array([compute_lz4_ratio(t) for t in texts], dtype=np.float64)
-
-    below = float(np.mean(ratios < lo))
-    in_band = float(np.mean((ratios >= lo) & (ratios <= hi)))
-    above = float(np.mean(ratios > hi))
 
     rep_subset = texts if max_rep_docs is None else texts[:max_rep_docs]
     rep_rows = [compute_gopher_repetition_rates(t) for t in rep_subset]
@@ -741,16 +670,6 @@ def audit_compression_and_repetition(
 
     return {
         "n_docs": len(texts),
-        "lz4_ratios": ratios.tolist(),
-        "lz4_mean": float(np.mean(ratios)),
-        "lz4_median": float(np.median(ratios)),
-        "lz4_std": float(np.std(ratios)),
-        "lz4_p05": float(np.percentile(ratios, 5)),
-        "lz4_p95": float(np.percentile(ratios, 95)),
-        "lz4_below_band_rate": below,
-        "lz4_in_band_rate": in_band,
-        "lz4_above_band_rate": above,
-        "lz4_out_of_band_rate": float(1.0 - in_band),
         "gopher_mean_rates": gopher_means,
         "gopher_flag_rate": gopher_flag_rate,
         "cross_doc_boilerplate_doc_rate": cross_doc["cross_doc_boilerplate_doc_rate"],
@@ -759,7 +678,7 @@ def audit_compression_and_repetition(
 
 
 # ---------------------------------------------------------------------------
-# 2. Domain Alignment (Unigram/Bigram JSD, Common-Word Coverage, Top-K Jaccard)
+# 2. Domain Alignment (Unigram/Bigram JSD & Top-K Jaccard)
 # ---------------------------------------------------------------------------
 
 
@@ -791,12 +710,7 @@ def build_ngram_profile(
 
 
 def compute_jsd_from_counts(counts_a: dict[str, int], counts_b: dict[str, int]) -> float:
-    """Compute true Jensen-Shannon Divergence in bits ([0, 1]) from two count dictionaries.
-
-    Uses base-2 logarithm so JSD(P || Q) == 0 for identical distributions and 1 for
-    disjoint supports. Note ``scipy.spatial.distance.jensenshannon`` returns sqrt(JSD),
-    so we square it to obtain JSD itself.
-    """
+    """Compute true Jensen-Shannon Divergence in bits ([0, 1]) from two count dictionaries."""
     if not counts_a or not counts_b:
         return 1.0
 
@@ -829,11 +743,6 @@ def audit_domain_alignment(
     union_sz = len(cand_vocab | ref_vocab)
     jaccard = float(len(cand_vocab & ref_vocab) / union_sz) if union_sz > 0 else 0.0
 
-    ref_unigrams: dict[str, int] = reference_profile["unigram_counts"]
-    ref_total = sum(ref_unigrams.values())
-    covered_tokens = sum(cnt for w, cnt in ref_unigrams.items() if w in cand_vocab)
-    common_word_coverage = float(covered_tokens / ref_total) if ref_total > 0 else 0.0
-
     unigram_jsd = compute_jsd_from_counts(
         candidate_profile["unigram_counts"],
         reference_profile["unigram_counts"],
@@ -845,7 +754,6 @@ def audit_domain_alignment(
 
     return {
         "top10k_jaccard": jaccard,
-        "common_word_coverage": common_word_coverage,
         "unigram_jsd": unigram_jsd,
         "bigram_jsd": bigram_jsd,
     }
@@ -884,11 +792,7 @@ def audit_contamination_13gram(
     max_sample_matches: int = 5,
     precomputed_index: tuple[set[str], dict[str, list[int]], int] | None = None,
 ) -> dict[str, Any]:
-    """Measure exact 13-gram overlap between a candidate slice and an evaluation split.
-
-    Distinguishes healthy domain proximity (low JSD, near-zero 13-gram leakage) from
-    verbatim benchmark contamination.
-    """
+    """Measure exact 13-gram overlap between a candidate slice and an evaluation split."""
     if precomputed_index is not None:
         eval_ngrams, ngram_to_examples, eligible_examples = precomputed_index
     else:
@@ -960,19 +864,13 @@ def stream_aggregate_audit(
     num_shards_to_sample: int = 8,
     shuffle_buffer_size: int = 2_000,
     seed: int = 42,
-    lz4_reservoir_size: int = 10_000,
     top_vocab_k: int = 10_000,
     top_bigram_k: int = 50_000,
     bigram_prune_every: int = 25_000,
     hf_token: str | None = None,
     row_stream: Iterator[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Aggregate LZ4, Gopher repetition, lexical profile, and 13-gram contamination in O(1) doc RAM.
-
-    Pass ``max_tokens=None, max_docs=None, random_sample=False`` to sweep an entire
-    dataset end-to-end without storing raw document strings in memory or disk, or pass
-    ``max_tokens`` with ``random_sample=True`` for a large multi-shard random audit.
-    """
+    """Aggregate Gopher repetition, lexical profile, and 13-gram contamination in O(1) doc RAM."""
     enc = get_gpt2_tokenizer() if row_stream is None else None
     if row_stream is None:
         token = hf_token or os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
@@ -992,18 +890,10 @@ def stream_aggregate_audit(
     else:
         rows_iter = row_stream
 
-    lo, hi = GOLDILOCKS_LZ4_BAND
-    rng = random.Random(seed)
     ngram_keys = [f"top_{n}gram" for n in (2, 3, 4)] + [f"dup_{n}gram" for n in range(5, 11)]
 
     n_docs = 0
     total_tokens = 0
-    lz4_sum = 0.0
-    lz4_below = 0
-    lz4_in = 0
-    lz4_above = 0
-    lz4_reservoir: list[float] = []
-
     gopher_sums = {k: 0.0 for k in ngram_keys}
     gopher_flagged_docs = 0
 
@@ -1030,31 +920,12 @@ def stream_aggregate_audit(
         n_docs += 1
         total_tokens += n_tok
 
-        # 1. LZ4 streaming stats + Vitter reservoir sample for density/quantile plots
-        ratio = compute_lz4_ratio(text)
-        lz4_sum += ratio
-        if ratio < lo:
-            lz4_below += 1
-        elif ratio <= hi:
-            lz4_in += 1
-        else:
-            lz4_above += 1
-
-        if len(lz4_reservoir) < lz4_reservoir_size:
-            lz4_reservoir.append(ratio)
-        else:
-            j = rng.randint(0, n_docs - 1)
-            if j < lz4_reservoir_size:
-                lz4_reservoir[j] = ratio
-
-        # 2. Gopher within-document repetition
         rep = compute_gopher_repetition_rates(text)
         for k in ngram_keys:
             gopher_sums[k] += rep[k]
         if rep["gopher_flagged"]:
             gopher_flagged_docs += 1
 
-        # 3. Lexical profile (unigrams + periodically pruned bigrams to bound RAM)
         words = normalize_words(text)
         unigrams.update(words)
         if len(words) >= 2:
@@ -1062,7 +933,6 @@ def stream_aggregate_audit(
         if bigram_prune_every > 0 and n_docs % bigram_prune_every == 0 and len(bigrams) > top_bigram_k * 4:
             bigrams = Counter(dict(bigrams.most_common(top_bigram_k * 2)))
 
-        # 4. Streaming 13-gram contamination scan
         if eval_indices:
             alnum_words = normalize_alnum_words(text)
             if len(alnum_words) >= 13:
@@ -1084,21 +954,8 @@ def stream_aggregate_audit(
         ):
             break
 
-    res_arr = np.array(lz4_reservoir, dtype=np.float64) if lz4_reservoir else np.array([0.0])
-    in_band_rate = float(lz4_in / n_docs) if n_docs > 0 else 0.0
-
-    compression_rep = {
+    repetition_boilerplate = {
         "n_docs": n_docs,
-        "lz4_ratios": lz4_reservoir,
-        "lz4_mean": float(lz4_sum / n_docs) if n_docs > 0 else 0.0,
-        "lz4_median": float(np.median(res_arr)) if n_docs > 0 else 0.0,
-        "lz4_std": float(np.std(res_arr)) if n_docs > 0 else 0.0,
-        "lz4_p05": float(np.percentile(res_arr, 5)) if n_docs > 0 else 0.0,
-        "lz4_p95": float(np.percentile(res_arr, 95)) if n_docs > 0 else 0.0,
-        "lz4_below_band_rate": float(lz4_below / n_docs) if n_docs > 0 else 0.0,
-        "lz4_in_band_rate": in_band_rate,
-        "lz4_above_band_rate": float(lz4_above / n_docs) if n_docs > 0 else 0.0,
-        "lz4_out_of_band_rate": float(1.0 - in_band_rate) if n_docs > 0 else 0.0,
         "gopher_mean_rates": {
             k: float(gopher_sums[k] / n_docs) if n_docs > 0 else 0.0 for k in ngram_keys
         },
@@ -1136,7 +993,7 @@ def stream_aggregate_audit(
         "n_docs": n_docs,
         "total_tokens": total_tokens,
         "mean_doc_tokens": float(total_tokens / n_docs) if n_docs > 0 else 0.0,
-        "compression_repetition": compression_rep,
+        "repetition_boilerplate": repetition_boilerplate,
         "lexical_profile": lexical_profile,
         "contamination": contamination,
     }
@@ -1153,13 +1010,13 @@ def audit_dataset_slice(
     top_vocab_k: int = 10_000,
     top_bigram_k: int = 50_000,
 ) -> dict[str, Any]:
-    """Run LZ4 compression, Gopher repetition, cross-doc boilerplate, and lexical profiling."""
+    """Run Gopher repetition, cross-doc boilerplate, and lexical profiling on one slice."""
     texts = [r["text"] for r in records]
     token_counts = [int(r.get("n_tokens", 0)) for r in records]
     total_tokens = int(sum(token_counts))
     mean_doc_tokens = float(np.mean(token_counts)) if token_counts else 0.0
 
-    compression_rep = audit_compression_and_repetition(texts)
+    repetition_boilerplate = audit_repetition_and_boilerplate(texts)
     lexical_profile = build_ngram_profile(
         texts, top_vocab_k=top_vocab_k, top_bigram_k=top_bigram_k
     )
@@ -1169,7 +1026,7 @@ def audit_dataset_slice(
         "n_docs": len(texts),
         "total_tokens": total_tokens,
         "mean_doc_tokens": mean_doc_tokens,
-        "compression_repetition": compression_rep,
+        "repetition_boilerplate": repetition_boilerplate,
         "lexical_profile": lexical_profile,
     }
 
@@ -1235,36 +1092,32 @@ def build_scorecard(
     contamination_matrix: dict[str, dict[str, dict[str, Any]]],
     control_key: str = "openwebtext",
 ) -> pd.DataFrame:
-    """Build a ranked Pandas DataFrame from non-overlapping Cleanliness, Alignment, and Contamination metrics."""
+    """Build a ranked Pandas DataFrame from length-unbiased Cleanliness, JSD Alignment, and Contamination."""
     rows: list[dict[str, Any]] = []
 
     for key, audit in dataset_audits.items():
-        comp = audit["compression_repetition"]
+        rep = audit["repetition_boilerplate"]
 
-        # Cleanliness / noise rate: LZ4 out-of-band (50%) + Gopher repetition (35%) + cross-doc 7g boilerplate (15%)
+        # Pure repetition + boilerplate noise rate (no length-confounded LZ4 compression)
         noise_rate = (
-            0.50 * comp["lz4_out_of_band_rate"]
-            + 0.35 * comp["gopher_flag_rate"]
-            + 0.15 * comp["cross_doc_boilerplate_doc_rate"]
+            0.70 * rep["gopher_flag_rate"]
+            + 0.30 * rep["cross_doc_boilerplate_doc_rate"]
         )
 
-        # Alignment to GPT-2 benchmarks (excluding OpenWebText control)
+        # Distributional proximity to GPT-2 benchmarks (excluding OpenWebText control)
         align_for_ds = alignment_matrix.get(key, {})
         eval_aligns = [v for rk, v in align_for_ds.items() if rk != control_key]
         if eval_aligns:
             mean_eval_uni_jsd = float(np.mean([a["unigram_jsd"] for a in eval_aligns]))
             mean_eval_bi_jsd = float(np.mean([a["bigram_jsd"] for a in eval_aligns]))
-            mean_eval_cov = float(np.mean([a["common_word_coverage"] for a in eval_aligns]))
             mean_eval_jaccard = float(np.mean([a["top10k_jaccard"] for a in eval_aligns]))
             benchmark_alignment_score = 100.0 * (
-                0.45 * (1.0 - mean_eval_uni_jsd)
-                + 0.25 * (1.0 - mean_eval_bi_jsd)
-                + 0.30 * mean_eval_cov
+                0.60 * (1.0 - mean_eval_uni_jsd)
+                + 0.40 * (1.0 - mean_eval_bi_jsd)
             )
         else:
             mean_eval_uni_jsd = 1.0
             mean_eval_bi_jsd = 1.0
-            mean_eval_cov = 0.0
             mean_eval_jaccard = 0.0
             benchmark_alignment_score = 0.0
 
@@ -1284,10 +1137,10 @@ def build_scorecard(
             mean_contam_pct = 0.0
             max_contam_pct = 0.0
 
-        # Overall composite score in [0, 100]: 45% Cleanliness + 40% Benchmark Alignment + 15% Decontamination
+        # Composite score [0, 100]: 40% Cleanliness + 45% JSD Benchmark Alignment + 15% Decontamination
         composite_score = (
-            45.0 * (1.0 - min(1.0, noise_rate))
-            + 40.0 * (benchmark_alignment_score / 100.0)
+            40.0 * (1.0 - min(1.0, noise_rate))
+            + 45.0 * (benchmark_alignment_score / 100.0)
             + 15.0 * max(0.0, 1.0 - max_contam_pct / 5.0)
         )
 
@@ -1298,14 +1151,14 @@ def build_scorecard(
                 "Key": key,
                 "Docs": audit["n_docs"],
                 "Tokens": audit["total_tokens"],
-                "LZ4 In-Band (%)": round(100.0 * comp["lz4_in_band_rate"], 2),
-                "Gopher Rep Flag (%)": round(100.0 * comp["gopher_flag_rate"], 2),
-                "Cross-Doc Boilerplate (%)": round(100.0 * comp["cross_doc_boilerplate_doc_rate"], 2),
+                "Mean Tok/Doc": round(audit["mean_doc_tokens"], 1),
+                "Gopher Rep Flag (%)": round(100.0 * rep["gopher_flag_rate"], 2),
+                "Cross-Doc Boilerplate (%)": round(100.0 * rep["cross_doc_boilerplate_doc_rate"], 2),
                 "Noise Rate (%)": round(100.0 * noise_rate, 2),
                 "OWT Unigram JSD": round(owt_uni_jsd, 4) if not math.isnan(owt_uni_jsd) else None,
                 "Eval Mean JSD (Uni)": round(mean_eval_uni_jsd, 4),
+                "Eval Mean JSD (Bi)": round(mean_eval_bi_jsd, 4),
                 "Eval Top-10k Jaccard": round(mean_eval_jaccard, 4),
-                "Eval Word Coverage (%)": round(100.0 * mean_eval_cov, 2),
                 "GPT-2 Benchmark Alignment": round(benchmark_alignment_score, 2),
                 "13-gram Contam Mean (%)": round(mean_contam_pct, 4),
                 "13-gram Contam Max (%)": round(max_contam_pct, 4),

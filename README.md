@@ -6,8 +6,8 @@
 
 ![Kestrel Data Selection Pipeline](docs/images/01_kestrel_data_pipeline.png)
 
-- **Reusable Diagnostics Module:** [`src/kestrel/data/diagnostics.py`](src/kestrel/data/diagnostics.py) — multi-shard randomized streaming & constant-RAM full-stream aggregation (`tiktoken` `gpt2`), document-level LZ4 Goldilocks (`0.65–0.80`) compression, Gopher/FineWeb 2–10-gram repetition & cross-doc 7-gram boilerplate, OpenWebText & benchmark JSD/coverage alignment, and exact 13-gram contamination checks.
-- **Kaggle-Ready Interactive Audit Notebook:** [`notebooks/01_dataset_audit.ipynb`](notebooks/01_dataset_audit.ipynb) — self-contained with beginner-friendly explanations, explanatory diagrams, animated walkthroughs, and automatic GitHub repo sync on Kaggle (`git clone --depth 1 https://github.com/MohammedKamalAlsyd/kestrel.git`).
+- **Kaggle-Ready Self-Contained Audit Notebook:** [`notebooks/01_dataset_audit.ipynb`](notebooks/01_dataset_audit.ipynb) — self-contained audit & EDA workflow with multi-shard randomized streaming, Gopher repetition & cross-doc 7-gram boilerplate checks, **BERT (`all-MiniLM-L6-v2`) semantic topic modeling with `flan-t5-small` topic naming**, Unigram/Bigram JSD alignment, and 13-gram decontamination, reusing shared helpers in [`src/kestrel/utils/`](src/kestrel/utils/).
+- **Shared Utilities & Diagnostics:** [`src/kestrel/utils/`](src/kestrel/utils/) (`notebook.py`, `text.py`) for cross-notebook asset loading and text/GPT-2 tokenization; [`src/kestrel/data/diagnostics.py`](src/kestrel/data/diagnostics.py) for programmatic/CI reuse and constant-RAM full-stream aggregation.
 - **Mixture Justification Report:** [`docs/dataset_justification.md`](docs/dataset_justification.md) — full comparison of all 6 audited corpora (`FineWeb-Edu`, `DCLM-Baseline 1.0`, `Nemotron-CC v2.1`, `Nemotron-ClimbMix`, `FinePDFs-Edu`, `OpenWebText` control) and exact Stage-1 (90%) + Stage-2 Annealing (10%) mixture ratios.
 
 ## Quickstart
@@ -16,8 +16,6 @@
 # Install with data audit & test dependencies
 uv sync --extra data --extra dev
 
-# Run diagnostics unit tests
-PYTHONPATH=src pytest -v tests/test_diagnostics.py
 ```
 
 On **Kaggle**, upload [`notebooks/01_dataset_audit.ipynb`](notebooks/01_dataset_audit.ipynb), enable **Internet** in the Kaggle sidebar, and run all cells — Cell 1 automatically clones this repository and installs missing dependencies.
