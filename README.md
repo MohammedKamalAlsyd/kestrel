@@ -27,6 +27,7 @@ Kestrel trains on **one single corpus from start to finish**—**`Nemotron-Climb
 - **Kaggle-Ready Self-Contained Audit Notebook:** [`notebooks/01_dataset_audit.ipynb`](notebooks/01_dataset_audit.ipynb) — modular, strictly test-set-blind corpus audit featuring multi-shard randomized streaming (`3.5M` GPT-2 tokens across 8 random shards per corpus), exploratory data analysis (lengths, character formatting, TF-IDF terms, raw spot-checks), and BERT semantic topic modeling (`all-MiniLM-L6-v2` + `google/flan-t5-small` full-width topic heatmap).
 - **Shared Utilities:** [`src/kestrel/utils/`](src/kestrel/utils/) (`notebook.py`, `text.py`) — reusable Kaggle/Hugging Face cache helpers and GPT-2 tokenization/text helpers shared across Kestrel notebooks.
 - **Empirical Audit Notes:** [`docs/dataset_justification.md`](docs/dataset_justification.md) — full audited corpus summary table, BERT topic breakdown, and published scaling comparisons (CLIMB, DCLM, FineWeb-Edu).
+- **Candidate Architectures & Evaluation Protocol:** [`docs/architectures.md`](docs/architectures.md) — full macro + repeated-block + attention/mixer/MoE diagrams for all 4 candidates (`configs/model/*.json`) and our 2-stage evaluation methodology vs. GPT-2 XL.
 
 ## Quickstart
 
