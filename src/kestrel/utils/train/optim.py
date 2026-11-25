@@ -50,7 +50,7 @@ def build_optimizers(model: nn.Module, cfg: Any) -> dict[str, torch.optim.Optimi
         is_1d_or_norm = (
             p.ndim < 2
             or name.endswith(".bias")
-            or any(tag in name.lower() for tag in ("norm", "lambda", "gate_scalar"))
+            or any(tag in name.lower() for tag in ("norm", "lambda", "gate_scalar", "mhc"))
         )
 
         if cfg.optimizer_type == "muon_adamw" and p.ndim == 2 and not is_emb_or_head and not is_1d_or_norm:

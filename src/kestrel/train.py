@@ -41,6 +41,7 @@ from kestrel.config import (
     extract_model_metadata,
     load_model_config,
 )
+from kestrel.models import KestrelForCausalLM, KestrelModelBuilder, register_kestrel_models
 from kestrel.tracking.mlflow_tracker import KestrelMLflowTracker
 from kestrel.utils.data import get_gpt2_tokenizer
 from kestrel.utils.train import (
@@ -130,13 +131,17 @@ def stream_packed_batches(
 
 
 def build_model_from_config(cfg: TrainConfig) -> tuple[nn.Module, dict[str, Any]]:
-    """Build a causal LM from a model config JSON via HF `AutoModelForCausalLM` (supports custom code)."""
+    """Build a causal LM from a model config JSON via `KestrelModelBuilder` or HF `AutoModelForCausalLM`."""
     from transformers import AutoConfig, AutoModelForCausalLM
 
     if not cfg.model_config_path:
         raise ValueError("Set `model_config_path` (or `--model-config`), or pass a pre-built model to train().")
 
+    register_kestrel_models()
     raw = load_model_config(cfg.model_config_path)
+    if raw.get("model_type") == "kestrel":
+        return KestrelModelBuilder.build(cfg.model_config_path)
+
     hf_cfg = AutoConfig.from_pretrained(cfg.model_config_path, trust_remote_code=True)
     model = AutoModelForCausalLM.from_config(hf_cfg, trust_remote_code=True)
 
@@ -166,7 +171,10 @@ def compute_unified_loss(
 
     Models receive `document_ids` so they can block attention across packed documents.
     """
-    out = model(input_ids, document_ids=document_ids)
+    if isinstance(unwrap_model(model), KestrelForCausalLM):
+        out = model(input_ids, document_ids=document_ids, mtp_labels=labels, use_cache=False)
+    else:
+        out = model(input_ids, document_ids=document_ids)
     logits = out if isinstance(out, torch.Tensor) else _field(out, "logits")
     lm_loss = None if isinstance(out, torch.Tensor) else _field(out, "loss")
     if lm_loss is None:
@@ -234,6 +242,8 @@ def train(cfg: TrainConfig, model: nn.Module | None = None) -> dict[str, Any]:
     # Model (+ metadata such as hf_repo_id / blueprint / track read from the model JSON)
     model, model_cfg = build_model_from_config(cfg) if model is None else (model, None)
     model_cfg = model_cfg or _model_config_dict(model)
+    if cfg.gradient_checkpointing and hasattr(unwrap_model(model), "gradient_checkpointing_enable"):
+        unwrap_model(model).gradient_checkpointing_enable()
     model = model.to(device)
     if world_size > 1:
         model = DDP(model, device_ids=[local_rank] if device.type == "cuda" else None)

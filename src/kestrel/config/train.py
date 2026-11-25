@@ -49,11 +49,12 @@ class TrainConfig:
     wsd_decay_type: str = "cosine"  # "cosine" | "linear" | "sqrt"
     min_lr_ratio: float = 0.1
 
-    # Auxiliary losses & precision ("auto" picks bf16 on Ampere+, fp16 on T4, fp32 on CPU)
+    # Auxiliary losses, precision & memory ("auto" picks bf16 on Ampere+, fp16 on T4, fp32 on CPU)
     z_loss_weight: float = 1e-4
     aux_loss_weight: float = 1.0  # MoE balance term returned by the model (if any)
     mtp_loss_weight: float = 0.3  # Multi-token-prediction term returned by the model (if any)
     precision: str = "auto"  # "auto" | "bf16" | "fp16" | "fp32"
+    gradient_checkpointing: bool = False
 
     # Logging, checkpointing & tracking
     log_interval: int = 10
