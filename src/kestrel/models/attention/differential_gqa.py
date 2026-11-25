@@ -14,6 +14,9 @@ from kestrel.models.norms import RMSNorm
 from kestrel.models.rope import apply_rotary_pos_emb
 
 
+_UNSET_MASK = object()
+
+
 class DifferentialGQA(nn.Module):
     """Differential GQA: splits Q/K into two halves `(q1, q2)` and computes `attn1 - lambda * attn2`."""
 
@@ -76,6 +79,7 @@ class DifferentialGQA(nn.Module):
         sin: torch.Tensor | None = None,
         document_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
+        precomputed_mask: torch.Tensor | None | object = _UNSET_MASK,
         kv_cache: KVCache | None = None,
     ) -> torch.Tensor:
         bsz, seq_len, _ = x.shape
@@ -103,17 +107,20 @@ class DifferentialGQA(nn.Module):
             past_len = k1.shape[-2] - seq_len
 
         kv_len = k1.shape[-2]
-        mask = create_causal_mask(
-            bsz,
-            seq_len,
-            kv_len,
-            past_len=past_len,
-            sliding_window=self.sliding_window,
-            document_ids=document_ids,
-            attention_mask=attention_mask,
-            device=x.device,
-            dtype=q1.dtype,
-        )
+        if precomputed_mask is _UNSET_MASK or kv_cache is not None:
+            mask = create_causal_mask(
+                bsz,
+                seq_len,
+                kv_len,
+                past_len=past_len,
+                sliding_window=self.sliding_window,
+                document_ids=document_ids,
+                attention_mask=attention_mask,
+                device=x.device,
+                dtype=q1.dtype,
+            )
+        else:
+            mask = precomputed_mask  # type: ignore[assignment]
 
         scale = 1.0 / math.sqrt(self.half_dim)
         gqa = self.num_kv_heads != self.num_heads

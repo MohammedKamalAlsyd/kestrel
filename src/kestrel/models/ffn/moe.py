@@ -73,15 +73,30 @@ class MoESwiGLUFFN(nn.Module):
         aux_loss = self.seq_aux_loss_alpha * self.num_routed_experts * (f_i * p_i).sum()
         self._last_aux_loss = aux_loss.detach()
 
+        # Sort routed assignments once by expert id (eliminates 16 per-expert CUDA syncs)
+        flat_expert_ids = topk_idx.reshape(-1)  # (N * K,)
+        flat_weights = topk_weights.reshape(-1, 1)  # (N * K, 1)
+        token_ids = (
+            torch.arange(flat_x.shape[0], device=x.device)
+            .unsqueeze(1)
+            .expand(-1, self.num_experts_per_tok)
+            .reshape(-1)
+        )
+        order = torch.argsort(flat_expert_ids, stable=False)
+        sorted_tokens = token_ids[order]
+        sorted_weights = flat_weights[order]
+        sorted_x = flat_x[sorted_tokens]
+
         routed_out = torch.zeros_like(flat_x)
-        for expert_id, expert in enumerate(self.experts):
-            tok_mask = topk_idx == expert_id
-            if not tok_mask.any():
+        counts_list = counts.long().tolist()
+        offset = 0
+        for expert_id, count in enumerate(counts_list):
+            if count == 0:
                 continue
-            tok_pos, slot_pos = torch.where(tok_mask)
-            expert_out = expert(flat_x[tok_pos])
-            w = topk_weights[tok_pos, slot_pos].unsqueeze(-1)
-            routed_out.index_add_(0, tok_pos, expert_out * w)
+            next_offset = offset + count
+            expert_out = self.experts[expert_id](sorted_x[offset:next_offset])
+            routed_out.index_add_(0, sorted_tokens[offset:next_offset], expert_out * sorted_weights[offset:next_offset])
+            offset = next_offset
 
         out = routed_out.reshape(bsz, seq_len, dim)
         if self.shared_expert is not None:

@@ -9,6 +9,8 @@ Run on Kaggle (1 or 2 GPUs) with everything driven by JSON configs plus optional
 
 Related modules:
 - `kestrel.config`            TrainConfig, TrackingConfig, model JSON loading, CLI overrides
+- `kestrel.models`            KestrelConfig, KestrelForCausalLM, KestrelModelBuilder
+- `kestrel.metrics`           Plateau estimation, capacity eRank, stratified val loss, grad health
 - `kestrel.utils.train`       device, dtype (bf16/fp16/fp32), DDP, seeds, Muon/AdamW, checkpoints
 - `kestrel.utils.data`        GPT-2 tokenization and text helpers
 - `kestrel.tracking`          DagsHub MLflow logging and GitHub run snapshots
@@ -20,6 +22,8 @@ from __future__ import annotations
 import argparse
 import contextlib
 import math
+import queue
+import threading
 import time
 from collections import defaultdict
 from dataclasses import asdict
@@ -33,6 +37,7 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
 from kestrel.config import (
     TrackingConfig,
@@ -40,6 +45,12 @@ from kestrel.config import (
     apply_overrides,
     extract_model_metadata,
     load_model_config,
+)
+from kestrel.metrics import (
+    GradientHealthMonitor,
+    PlateauTracker,
+    measure_model_capacity,
+    stratified_token_losses,
 )
 from kestrel.models import KestrelForCausalLM, KestrelModelBuilder, register_kestrel_models
 from kestrel.tracking.mlflow_tracker import KestrelMLflowTracker
@@ -125,6 +136,48 @@ def stream_packed_batches(
         yield torch.stack(xs), torch.stack(ys), torch.stack(ds_)
 
 
+def prefetch_batches(
+    batch_iter: Iterator[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    *,
+    prefetch_size: int = 4,
+    pin_memory: bool = False,
+) -> Iterator[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """Overlap remote HF streaming & tokenization with GPU compute via a background queue."""
+    if prefetch_size <= 0:
+        yield from batch_iter
+        return
+
+    buf: queue.Queue[Any] = queue.Queue(maxsize=prefetch_size)
+    stop_event = threading.Event()
+    sentinel = object()
+
+    def _worker() -> None:
+        try:
+            for x, y, docs in batch_iter:
+                if stop_event.is_set():
+                    break
+                if pin_memory:
+                    x, y, docs = x.pin_memory(), y.pin_memory(), docs.pin_memory()
+                buf.put((x, y, docs))
+        except BaseException as exc:
+            buf.put(exc)
+        finally:
+            buf.put(sentinel)
+
+    thread = threading.Thread(target=_worker, name="kestrel-prefetch", daemon=True)
+    thread.start()
+    try:
+        while True:
+            item = buf.get()
+            if item is sentinel:
+                break
+            if isinstance(item, BaseException):
+                raise item
+            yield item
+    finally:
+        stop_event.set()
+
+
 # ---------------------------------------------------------------------------
 # 2. Model loading, unified loss, eval, and post-step hooks
 # ---------------------------------------------------------------------------
@@ -160,38 +213,103 @@ def _field(out: Any, name: str) -> Any:
     return out.get(name) if isinstance(out, dict) else getattr(out, name, None)
 
 
+def _chunked_lm_and_z_loss(
+    hidden_states: torch.Tensor,
+    labels: torch.Tensor,
+    lm_head: nn.Linear,
+    *,
+    chunk_size: int,
+    z_loss_weight: float,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Compute exact CE + z-loss in sequence chunks without materializing full `(B, T, V)` FP32 logits."""
+    seq_len = hidden_states.shape[1]
+    total_valid = (labels != -100).sum().clamp(min=1)
+    total_tokens = max(1, labels.numel())
+
+    def _chunk_fn(h_chunk: torch.Tensor, y_chunk: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        logits = lm_head(h_chunk).float()
+        ce = F.cross_entropy(logits.reshape(-1, logits.size(-1)), y_chunk.reshape(-1), ignore_index=-100, reduction="sum")
+        z = torch.logsumexp(logits, dim=-1).pow(2).sum() if z_loss_weight > 0 else ce.new_zeros(())
+        return ce, z
+
+    ce_total = hidden_states.new_zeros((), dtype=torch.float32)
+    z_total = hidden_states.new_zeros((), dtype=torch.float32)
+    use_ckpt = hidden_states.requires_grad and torch.is_grad_enabled()
+
+    for start in range(0, seq_len, chunk_size):
+        end = min(start + chunk_size, seq_len)
+        h_c = hidden_states[:, start:end, :]
+        y_c = labels[:, start:end]
+        if use_ckpt:
+            ce_c, z_c = torch_checkpoint(_chunk_fn, h_c, y_c, use_reentrant=False)
+        else:
+            ce_c, z_c = _chunk_fn(h_c, y_c)
+        ce_total = ce_total + ce_c
+        if z_loss_weight > 0:
+            z_total = z_total + z_c
+
+    lm_loss = ce_total / total_valid
+    z_loss = (z_total / total_tokens) if z_loss_weight > 0 else None
+    return lm_loss, z_loss
+
+
 def compute_unified_loss(
     model: nn.Module,
     input_ids: torch.Tensor,
     labels: torch.Tensor,
     document_ids: torch.Tensor,
     cfg: TrainConfig,
-) -> tuple[torch.Tensor, dict[str, float]]:
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """One forward pass -> LM loss + z-loss + optional aux (MoE) and MTP losses.
 
-    Models receive `document_ids` so they can block attention across packed documents.
+    Uses chunked `lm_head` + CE + z-loss on `KestrelForCausalLM` when `cfg.loss_chunk_size > 0`
+    and keeps stats as detached GPU tensors so zero GPU->CPU syncs happen per microbatch.
     """
-    if isinstance(unwrap_model(model), KestrelForCausalLM):
-        out = model(input_ids, document_ids=document_ids, mtp_labels=labels, use_cache=False)
+    raw = unwrap_model(model)
+    is_kestrel = isinstance(raw, KestrelForCausalLM)
+    use_chunked = is_kestrel and cfg.loss_chunk_size > 0 and cfg.loss_chunk_size < input_ids.shape[1]
+
+    if is_kestrel:
+        out = model(
+            input_ids,
+            document_ids=document_ids,
+            mtp_labels=labels,
+            use_cache=False,
+            compute_logits=(not use_chunked),
+        )
     else:
         out = model(input_ids, document_ids=document_ids)
+
     logits = out if isinstance(out, torch.Tensor) else _field(out, "logits")
     lm_loss = None if isinstance(out, torch.Tensor) else _field(out, "loss")
-    if lm_loss is None:
-        lm_loss = F.cross_entropy(logits.float().reshape(-1, logits.size(-1)), labels.reshape(-1), ignore_index=-100)
+    z_loss: torch.Tensor | None = None
+
+    if use_chunked:
+        hidden = _field(out, "last_hidden_state")
+        lm_loss, z_loss = _chunked_lm_and_z_loss(
+            hidden,
+            labels,
+            raw.lm_head,
+            chunk_size=cfg.loss_chunk_size,
+            z_loss_weight=cfg.z_loss_weight,
+        )
+    else:
+        if lm_loss is None:
+            lm_loss = F.cross_entropy(logits.float().reshape(-1, logits.size(-1)), labels.reshape(-1), ignore_index=-100)
+        if cfg.z_loss_weight > 0 and logits is not None:
+            z_loss = torch.logsumexp(logits.float(), dim=-1).pow(2).mean()
 
     total = lm_loss
-    stats = {"lm": float(lm_loss.detach())}
+    stats: dict[str, torch.Tensor] = {"lm": lm_loss.detach()}
 
-    if cfg.z_loss_weight > 0 and logits is not None:  # keeps final logits from drifting
-        z = torch.logsumexp(logits.float(), dim=-1).pow(2).mean()
-        total = total + cfg.z_loss_weight * z
-        stats["z_loss"] = float(z.detach())
+    if z_loss is not None and cfg.z_loss_weight > 0:
+        total = total + cfg.z_loss_weight * z_loss
+        stats["z_loss"] = z_loss.detach()
     for name, weight in (("aux_loss", cfg.aux_loss_weight), ("mtp_loss", cfg.mtp_loss_weight)):
         extra = None if isinstance(out, torch.Tensor) else _field(out, name)
         if extra is not None and weight > 0:
             total = total + weight * extra
-            stats[name] = float(extra.detach())
+            stats[name] = extra.detach()
     return total, stats
 
 
@@ -207,24 +325,54 @@ def _post_step_hooks(model: nn.Module) -> dict[str, float]:
 
 
 @torch.no_grad()
-def _evaluate(model, val_batches, cfg, device, autocast_ctx, world_size) -> tuple[float, float]:
-    """Mean validation LM loss and perplexity over a fixed set of held-out batches."""
+def _evaluate(model, val_batches, cfg, device, autocast_ctx, world_size) -> tuple[float, float, dict[str, float]]:
+    """Compute validation LM loss, perplexity, stratified token losses, and capacity metrics."""
     was_training = model.training
     model.eval()
-    losses = []
-    for x, y, docs in val_batches:
-        with autocast_ctx():
-            _, stats = compute_unified_loss(model, x.to(device), y.to(device), docs.to(device), cfg)
-        losses.append(stats["lm"])
-    val_loss = sum(losses) / max(len(losses), 1)
+    raw = unwrap_model(model)
+    is_kestrel = isinstance(raw, KestrelForCausalLM)
 
+    losses: list[float] = []
+    strat_accum: dict[str, list[float]] = defaultdict(list)
+
+    for x, y, docs in val_batches:
+        xd, yd, dd = x.to(device, non_blocking=True), y.to(device, non_blocking=True), docs.to(device, non_blocking=True)
+        with autocast_ctx():
+            if is_kestrel and cfg.track_capacity_metrics:
+                out = model(xd, document_ids=dd, use_cache=False, compute_logits=False)
+                hidden = out.last_hidden_state
+                chunk = cfg.loss_chunk_size if cfg.loss_chunk_size > 0 else yd.shape[1]
+                tok_losses = []
+                for s in range(0, yd.shape[1], chunk):
+                    e = min(s + chunk, yd.shape[1])
+                    lg = raw.lm_head(hidden[:, s:e, :]).float()
+                    tok_losses.append(
+                        F.cross_entropy(lg.reshape(-1, lg.size(-1)), yd[:, s:e].reshape(-1), ignore_index=-100, reduction="none")
+                        .view(yd.shape[0], e - s)
+                    )
+                per_tok = torch.cat(tok_losses, dim=1)
+                valid = yd != -100
+                losses.append(float(per_tok[valid].mean().item()))
+                for k, v in stratified_token_losses(per_tok, yd).items():
+                    strat_accum[k].append(v)
+            else:
+                _, stats = compute_unified_loss(model, xd, yd, dd, cfg)
+                losses.append(float(stats["lm"].item()))
+
+    val_loss = sum(losses) / max(len(losses), 1)
     if world_size > 1 and dist.is_initialized():
         t = torch.tensor([val_loss], device=device, dtype=torch.float64)
         dist.all_reduce(t, op=dist.ReduceOp.AVG)
         val_loss = float(t.item())
+
+    extra_metrics = {k: sum(vs) / len(vs) for k, vs in strat_accum.items() if vs}
+    if cfg.track_capacity_metrics and val_batches:
+        x0, _, d0 = val_batches[0]
+        extra_metrics.update(measure_model_capacity(model, x0.to(device), d0.to(device), autocast_ctx))
+
     if was_training:
         model.train()
-    return val_loss, math.exp(min(val_loss, 20.0))
+    return val_loss, math.exp(min(val_loss, 20.0)), extra_metrics
 
 
 # ---------------------------------------------------------------------------
@@ -245,6 +393,8 @@ def train(cfg: TrainConfig, model: nn.Module | None = None) -> dict[str, Any]:
     if cfg.gradient_checkpointing and hasattr(unwrap_model(model), "gradient_checkpointing_enable"):
         unwrap_model(model).gradient_checkpointing_enable()
     model = model.to(device)
+    if cfg.compile_model and hasattr(torch, "compile"):
+        model = torch.compile(model)
     if world_size > 1:
         model = DDP(model, device_ids=[local_rank] if device.type == "cuda" else None)
 
@@ -253,9 +403,18 @@ def train(cfg: TrainConfig, model: nn.Module | None = None) -> dict[str, Any]:
         load_checkpoint(cfg.resume_from, model, optimizers, scaler, device) if cfg.resume_from else (0, 0, float("inf"))
     )
 
-    # Data: training stream + fixed held-out validation batches (different shuffle seed)
-    train_iter = stream_packed_batches(cfg, rank=rank, world_size=world_size)
+    # Data: async prefetched training stream + fixed held-out validation batches
+    raw_train_iter = stream_packed_batches(cfg, rank=rank, world_size=world_size)
+    train_iter = prefetch_batches(
+        raw_train_iter,
+        prefetch_size=cfg.prefetch_batches,
+        pin_memory=(device.type == "cuda"),
+    )
     val_batches = list(islice(stream_packed_batches(cfg, rank=rank, world_size=world_size, seed_offset=10_000), cfg.val_eval_batches))
+
+    # Capacity, gradient health & scaling/plateau monitors
+    plateau_tracker = PlateauTracker(plateau_delta_per_doubling=cfg.plateau_delta_per_doubling)
+    grad_monitor = GradientHealthMonitor(model, optimizers) if (is_main and cfg.track_capacity_metrics) else None
 
     # Tracking config: rank 0 only, inheriting hf_repo_id / blueprint / track from the model JSON
     tcfg = TrackingConfig(**asdict(cfg.tracking))
@@ -298,8 +457,8 @@ def train(cfg: TrainConfig, model: nn.Module | None = None) -> dict[str, Any]:
             for opt in optimizers.values():
                 opt.zero_grad(set_to_none=True)
 
-            # Gradient accumulation (average every logged loss term over micro-batches)
-            acc: dict[str, float] = defaultdict(float)
+            # Gradient accumulation (keep loss stats on GPU to avoid per-microbatch sync stalls)
+            acc_tensors: dict[str, torch.Tensor] = {}
             for micro in range(cfg.grad_accum_steps):
                 x, y, docs = (t.to(device, non_blocking=True) for t in next(train_iter))
                 skip_sync = isinstance(model, DDP) and micro < cfg.grad_accum_steps - 1
@@ -308,9 +467,10 @@ def train(cfg: TrainConfig, model: nn.Module | None = None) -> dict[str, Any]:
                         loss, stats = compute_unified_loss(model, x, y, docs, cfg)
                     scaled = loss / cfg.grad_accum_steps
                     (scaler.scale(scaled) if scaler else scaled).backward()
-                acc["loss"] += float(loss.detach()) / cfg.grad_accum_steps
+                inv_accum = 1.0 / cfg.grad_accum_steps
+                acc_tensors["loss"] = acc_tensors.get("loss", 0) + loss.detach() * inv_accum
                 for k, v in stats.items():
-                    acc[k] += v / cfg.grad_accum_steps
+                    acc_tensors[k] = acc_tensors.get(k, 0) + v * inv_accum
 
             if scaler:
                 for opt in optimizers.values():
@@ -321,19 +481,26 @@ def train(cfg: TrainConfig, model: nn.Module | None = None) -> dict[str, Any]:
                     cfg.max_grad_norm if cfg.max_grad_norm > 0 else float("inf"),
                 )
             )
+            should_log = is_main and (step == 1 or step % cfg.log_interval == 0 or step == cfg.max_steps)
+            grad_health: dict[str, float] = {}
+            if grad_monitor is not None and should_log:
+                grad_health.update(grad_monitor.before_step())
             for opt in optimizers.values():
                 scaler.step(opt) if scaler else opt.step()
             if scaler:
                 scaler.update()
+            if grad_monitor is not None and should_log:
+                grad_health.update(grad_monitor.after_step())
 
             hook_metrics = _post_step_hooks(model)  # Track C ALF-LB updates
             tokens_seen += tokens_per_step
-            final_train_loss = acc["lm"]
             step_sec = max(1e-6, time.perf_counter() - t_step)
             throughputs.append(tokens_per_step / step_sec)
             wall = time.perf_counter() - t_start
 
-            if is_main and (step == 1 or step % cfg.log_interval == 0 or step == cfg.max_steps):
+            if should_log:
+                acc = {k: float(v.item()) for k, v in acc_tensors.items()}
+                final_train_loss = acc["lm"]
                 metrics = {
                     **{f"train/{k}": v for k, v in acc.items() if k != "loss" or len(acc) > 2},
                     "train/ppl": math.exp(min(acc["lm"], 20.0)),
@@ -343,6 +510,7 @@ def train(cfg: TrainConfig, model: nn.Module | None = None) -> dict[str, Any]:
                     "progress/gpu_hours": wall * world_size / 3600,
                     **lrs,
                     **hook_metrics,
+                    **grad_health,
                 }
                 tracker.log_metrics(metrics, step=step)
                 print(
@@ -351,14 +519,24 @@ def train(cfg: TrainConfig, model: nn.Module | None = None) -> dict[str, Any]:
                 )
 
             if cfg.eval_interval > 0 and val_batches and (step % cfg.eval_interval == 0 or step == cfg.max_steps):
-                val_loss, val_ppl = _evaluate(model, val_batches, cfg, device, autocast_ctx, world_size)
+                val_loss, val_ppl, extra_eval = _evaluate(model, val_batches, cfg, device, autocast_ctx, world_size)
                 if is_main:
+                    in_cooldown = cfg.lr_schedule == "wsd" and step > (cfg.max_steps - cfg.decay_steps)
+                    plateau_metrics = plateau_tracker.update(step, float(tokens_seen), val_loss, is_cooldown=in_cooldown)
                     tracker.log_metrics(
-                        {"val/loss": val_loss, "val/ppl": val_ppl, "progress/tokens_seen": float(tokens_seen),
-                         "progress/gpu_hours": wall * world_size / 3600},
+                        {
+                            "val/loss": val_loss,
+                            "val/ppl": val_ppl,
+                            "progress/tokens_seen": float(tokens_seen),
+                            "progress/gpu_hours": wall * world_size / 3600,
+                            **extra_eval,
+                            **plateau_metrics,
+                        },
                         step=step,
                     )
-                    print(f"  [eval] step {step:>5d} | val_loss={val_loss:.4f} | val_ppl={val_ppl:.2f}")
+                    alpha_str = f" | alpha={plateau_metrics['plateau/alpha']:.3f}" if "plateau/alpha" in plateau_metrics else ""
+                    erank_str = f" | eRank={extra_eval['capacity/erank']:.1f}" if "capacity/erank" in extra_eval else ""
+                    print(f"  [eval] step {step:>5d} | val_loss={val_loss:.4f} | val_ppl={val_ppl:.2f}{erank_str}{alpha_str}")
                     if val_loss < best_val_loss:
                         best_val_loss, best_val_ppl = val_loss, val_ppl
                         last_hf_dir = save("best")

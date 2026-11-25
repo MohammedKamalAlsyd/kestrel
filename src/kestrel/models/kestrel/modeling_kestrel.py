@@ -16,6 +16,7 @@ from kestrel.models.cache import KVCache
 from kestrel.models.ffn import MoESwiGLUFFN
 from kestrel.models.heads import MultiTokenPredictionHead
 from kestrel.models.kestrel.configuration_kestrel import KestrelConfig
+from kestrel.models.masking import create_causal_mask
 from kestrel.models.norms import RMSNorm
 from kestrel.models.outputs import KestrelCausalLMOutput
 from kestrel.models.residuals import ManifoldHyperConnection
@@ -111,10 +112,33 @@ class KestrelModel(KestrelPreTrainedModel):
         if self.use_mhc:
             hidden_states = ManifoldHyperConnection.expand(hidden_states, self.config.mhc_num_streams)
 
+        # Precompute shared attention masks ONCE per microbatch (instead of 30x per layer)
+        shared_masks: dict[int | None, torch.Tensor | None] = {}
+        use_shared_masks = past_key_values is None
+        if use_shared_masks:
+            unique_windows = {
+                layer.sliding_window
+                for layer in self.layers
+                if layer.mixer_kind in ("gqa", "differential_gqa")
+            }
+            for win in unique_windows:
+                shared_masks[win] = create_causal_mask(
+                    bsz,
+                    seq_len,
+                    seq_len,
+                    past_len=0,
+                    sliding_window=win,
+                    document_ids=document_ids,
+                    attention_mask=attention_mask,
+                    device=device,
+                    dtype=hidden_states.dtype,
+                )
+
         v_first: torch.Tensor | None = None
         aux_losses: list[torch.Tensor] = []
 
         for idx, layer in enumerate(self.layers):
+            layer_mask = shared_masks.get(layer.sliding_window) if use_shared_masks else None
             if self.gradient_checkpointing and self.training and past_key_values is None:
                 def _layer_fn(
                     h: torch.Tensor,
@@ -122,6 +146,7 @@ class KestrelModel(KestrelPreTrainedModel):
                     s: torch.Tensor,
                     vf: torch.Tensor | None,
                     layer_mod: KestrelDecoderLayer = layer,
+                    lmask: torch.Tensor | None = layer_mask,
                 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
                     return layer_mod(
                         h,
@@ -130,6 +155,8 @@ class KestrelModel(KestrelPreTrainedModel):
                         v_first=vf,
                         document_ids=document_ids,
                         attention_mask=attention_mask,
+                        precomputed_mask=lmask,
+                        has_precomputed_mask=True,
                         kv_cache=None,
                     )
 
@@ -144,6 +171,8 @@ class KestrelModel(KestrelPreTrainedModel):
                     v_first=v_first,
                     document_ids=document_ids,
                     attention_mask=attention_mask,
+                    precomputed_mask=layer_mask,
+                    has_precomputed_mask=use_shared_masks,
                     kv_cache=past_key_values,
                 )
 
@@ -250,6 +279,7 @@ class KestrelForCausalLM(KestrelPreTrainedModel, GenerationMixin):
         labels: torch.Tensor | None = None,
         mtp_labels: torch.Tensor | None = None,
         use_cache: bool | None = None,
+        compute_logits: bool = True,
         **kwargs: Any,
     ) -> KestrelCausalLMOutput:
         use_cache_flag = self.config.use_cache if use_cache is None else bool(use_cache)
@@ -264,7 +294,7 @@ class KestrelForCausalLM(KestrelPreTrainedModel, GenerationMixin):
             document_ids=document_ids,
             use_cache=use_cache_flag,
         )
-        logits = self.lm_head(hidden_states)
+        logits = self.lm_head(hidden_states) if (compute_logits or labels is not None) else None
 
         loss: torch.Tensor | None = None
         if labels is not None:

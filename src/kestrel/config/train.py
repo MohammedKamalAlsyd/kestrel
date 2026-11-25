@@ -49,17 +49,22 @@ class TrainConfig:
     wsd_decay_type: str = "cosine"  # "cosine" | "linear" | "sqrt"
     min_lr_ratio: float = 0.1
 
-    # Auxiliary losses, precision & memory ("auto" picks bf16 on Ampere+, fp16 on T4, fp32 on CPU)
+    # Auxiliary losses, precision & speed ("auto" picks bf16 on Ampere+, fp16 on T4, fp32 on CPU)
     z_loss_weight: float = 1e-4
     aux_loss_weight: float = 1.0  # MoE balance term returned by the model (if any)
     mtp_loss_weight: float = 0.3  # Multi-token-prediction term returned by the model (if any)
     precision: str = "auto"  # "auto" | "bf16" | "fp16" | "fp32"
     gradient_checkpointing: bool = False
+    compile_model: bool = False  # Enable torch.compile() on Linux/Kaggle for kernel fusion
+    loss_chunk_size: int = 512  # Chunked lm_head + CE + z-loss (0 disables chunking)
+    prefetch_batches: int = 4  # Background thread prefetch depth (0 disables async prefetch)
 
-    # Logging, checkpointing & tracking
+    # Logging, checkpointing, capacity/plateau metrics & tracking
     log_interval: int = 10
     eval_interval: int = 100
     save_interval: int = 500
+    track_capacity_metrics: bool = True
+    plateau_delta_per_doubling: float = 0.02
     output_dir: str = "artifacts/checkpoints"
     resume_from: str | None = None
     seed: int = 42

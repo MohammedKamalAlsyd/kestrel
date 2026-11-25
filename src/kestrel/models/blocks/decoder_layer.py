@@ -32,6 +32,7 @@ class KestrelDecoderLayer(nn.Module):
 
         # Sequence mixer / attention selection
         self.mixer_kind, self.mixer = self._build_mixer(config, layer_idx)
+        self.sliding_window: int | None = getattr(self.mixer, "sliding_window", None)
 
         # Feed-forward selection
         self.is_moe = getattr(config, "ffn_type", "swiglu") == "moe_swiglu"
@@ -175,9 +176,12 @@ class KestrelDecoderLayer(nn.Module):
         v_first: torch.Tensor | None,
         document_ids: torch.Tensor | None,
         attention_mask: torch.Tensor | None,
+        precomputed_mask: Any = None,
+        has_precomputed_mask: bool = False,
         kv_cache: KVCache | None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         normed = self.pre_attn_norm(x)
+        mask_kwargs = {"precomputed_mask": precomputed_mask} if has_precomputed_mask else {}
         if self.mixer_kind == "gqa":
             out, v_raw = self.mixer(
                 normed,
@@ -187,6 +191,7 @@ class KestrelDecoderLayer(nn.Module):
                 document_ids=document_ids,
                 attention_mask=attention_mask,
                 kv_cache=kv_cache,
+                **mask_kwargs,
             )
             return self.post_attn_norm(out), v_raw
         if self.mixer_kind == "differential_gqa":
@@ -197,6 +202,7 @@ class KestrelDecoderLayer(nn.Module):
                 document_ids=document_ids,
                 attention_mask=attention_mask,
                 kv_cache=kv_cache,
+                **mask_kwargs,
             )
             return self.post_attn_norm(out), None
         out = self.mixer(normed, document_ids=document_ids, kv_cache=kv_cache)
@@ -218,6 +224,8 @@ class KestrelDecoderLayer(nn.Module):
         v_first: torch.Tensor | None = None,
         document_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
+        precomputed_mask: Any = None,
+        has_precomputed_mask: bool = False,
         kv_cache: KVCache | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         """Return `(hidden_states, v_raw_or_None, aux_loss_or_None)`."""
@@ -234,6 +242,8 @@ class KestrelDecoderLayer(nn.Module):
                 v_first=v_first,
                 document_ids=document_ids,
                 attention_mask=attention_mask,
+                precomputed_mask=precomputed_mask,
+                has_precomputed_mask=has_precomputed_mask,
                 kv_cache=kv_cache,
             )
             hidden_states = self.mhc_attn.post_update(hidden_states, attn_out)
@@ -249,6 +259,8 @@ class KestrelDecoderLayer(nn.Module):
                 v_first=v_first,
                 document_ids=document_ids,
                 attention_mask=attention_mask,
+                precomputed_mask=precomputed_mask,
+                has_precomputed_mask=has_precomputed_mask,
                 kv_cache=kv_cache,
             )
             hidden_states = hidden_states + attn_out

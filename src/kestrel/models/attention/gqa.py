@@ -13,6 +13,9 @@ from kestrel.models.residuals import ValueResidualGate
 from kestrel.models.rope import apply_rotary_pos_emb
 
 
+_UNSET_MASK = object()
+
+
 class GroupedQueryAttention(nn.Module):
     """Grouped-Query Attention supporting QK-Norm, RNoPE-SWA, Value Residuals, and KV caching."""
 
@@ -65,6 +68,7 @@ class GroupedQueryAttention(nn.Module):
         v_first: torch.Tensor | None = None,
         document_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
+        precomputed_mask: torch.Tensor | None | object = _UNSET_MASK,
         kv_cache: KVCache | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Return `(attn_output, v_raw)` where `v_raw` has shape `(B, H_kv, T, D)`."""
@@ -89,17 +93,20 @@ class GroupedQueryAttention(nn.Module):
             past_len = k.shape[-2] - seq_len
 
         kv_len = k.shape[-2]
-        mask = create_causal_mask(
-            bsz,
-            seq_len,
-            kv_len,
-            past_len=past_len,
-            sliding_window=self.sliding_window,
-            document_ids=document_ids,
-            attention_mask=attention_mask,
-            device=x.device,
-            dtype=q.dtype,
-        )
+        if precomputed_mask is _UNSET_MASK or kv_cache is not None:
+            mask = create_causal_mask(
+                bsz,
+                seq_len,
+                kv_len,
+                past_len=past_len,
+                sliding_window=self.sliding_window,
+                document_ids=document_ids,
+                attention_mask=attention_mask,
+                device=x.device,
+                dtype=q.dtype,
+            )
+        else:
+            mask = precomputed_mask  # type: ignore[assignment]
 
         out = F.scaled_dot_product_attention(
             q,
