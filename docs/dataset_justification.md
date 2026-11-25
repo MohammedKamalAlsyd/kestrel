@@ -37,9 +37,9 @@ Using `all-MiniLM-L6-v2` embeddings + KMeans (`K = 12`) + keyword-only `google/f
 
 ---
 
-## 3. Single-Dataset Selection Summary
+## 3. Final Single-Dataset Selection: `Nemotron-ClimbMix (400B)`
 
-Sticking to **one dataset for the entire training run** keeps Kestrel's training pipeline simple and reproducible:
-- **Best overall sub-1B reasoning & scaling (research / non-commercial):** **`Nemotron-ClimbMix (400B)`**
-- **Best 100% commercially permissive all-rounder:** **`DCLM-Baseline 1.0`** (`CC-BY-4.0`) — backed by strong CORE/MMLU scaling margins over `FineWeb-Edu`
-- **Cleanest educational/textbook permissive alternative:** **`FineWeb-Edu`** (`ODC-By v1.0`)
+Sticking to **one dataset for the entire training run** keeps Kestrel's training pipeline simple and reproducible. Based on our test-set-blind corpus audit combined with NVIDIA's CLIMB paper ([arXiv:2504.13161](https://arxiv.org/pdf/2504.13161)), **Kestrel selects `Nemotron-ClimbMix (400B)`** as its pretraining corpus:
+
+- **Primary Pick (Selected): `Nemotron-ClimbMix (400B)`** — Highest scaling performance across 1B pretraining runs (`52.43%` across 12 benchmarks at 400B tokens, outperforming `DCLM-Baseline` and `FineWeb-Edu`), `60.6%` science + practical Q&A concentration in our BERT topic audit, and compact 400B-token footprint *(non-commercial `CC-BY-NC-4.0` upstream terms)*.
+- **Commercially Permissive Runner-Up: `DCLM-Baseline 1.0`** (`CC-BY-4.0`) — Strongest commercially permissive track record (`48.9` vs. `41.9` CORE and `50.8` vs. `37.3` MMLU over `FineWeb-Edu` at 280B tokens), kept as backup if commercial licensing is required later.
