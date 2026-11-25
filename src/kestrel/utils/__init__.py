@@ -16,7 +16,6 @@ from kestrel.utils.notebook import (
     is_kaggle,
 )
 from kestrel.utils.optim import (
-    FallbackMuon,
     apply_lr_schedule,
     build_optimizers,
     compute_lr_multiplier,
@@ -29,7 +28,6 @@ from kestrel.utils.text import (
 )
 
 __all__ = [
-    "FallbackMuon",
     "WORD_RE",
     "apply_lr_schedule",
     "build_optimizers",

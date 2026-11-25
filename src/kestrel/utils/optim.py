@@ -1,10 +1,8 @@
 """Optimizer construction (Muon + AdamW) and LR schedules (WSD / Cosine) for Kestrel.
 
-Implements the paper's optimization recipe (Kestrel Study p. 21):
-- **Muon** on 2D hidden-layer weight matrices (using native `torch.optim.Muon` on PyTorch 2.9+
-  with a compact Newton-Schulz fallback for older PyTorch environments).
-- **AdamW** on input embeddings, LM head (tied or untied), 1D norms, biases, and learnable scalars.
-- **Warmup-Stable-Decay (WSD)** and **Cosine** schedules kept synchronized across both optimizers.
+- **Muon** (native `torch.optim.Muon`, requires PyTorch >= 2.9) optimizes 2D hidden-layer weight matrices.
+- **AdamW** optimizes input embeddings, the LM head (tied or untied), 1D norms, biases, and scalars.
+- **Warmup-Stable-Decay (WSD)** and **Cosine** schedules are applied to both optimizers in sync.
 """
 
 from __future__ import annotations
@@ -17,73 +15,6 @@ import torch
 import torch.nn as nn
 
 from kestrel.utils.checkpoint import unwrap_model
-
-
-def _newtonschulz5(g: torch.Tensor, steps: int = 5, eps: float = 1e-7) -> torch.Tensor:
-    """Quintic Newton-Schulz iteration mapping 2D gradients toward orthogonal updates."""
-    a, b, c = (3.4445, -4.7750, 2.0315)
-    x = g.bfloat16() if g.is_cuda else g.float()
-    transposed = x.size(0) > x.size(1)
-    if transposed:
-        x = x.T
-    x = x / (x.norm() + eps)
-    for _ in range(steps):
-        gram = x @ x.T
-        x = a * x + (b * gram + c * (gram @ gram)) @ x
-    return (x.T if transposed else x).to(dtype=g.dtype)
-
-
-class FallbackMuon(torch.optim.Optimizer):
-    """Pure-PyTorch Muon fallback used only when `torch.optim.Muon` is not available."""
-
-    def __init__(
-        self,
-        params: Any,
-        lr: float = 0.02,
-        weight_decay: float = 0.01,
-        momentum: float = 0.95,
-        nesterov: bool = True,
-        ns_steps: int = 5,
-        eps: float = 1e-7,
-        adjust_lr_fn: str | None = "match_rms_adamw",
-    ) -> None:
-        defaults = dict(
-            lr=lr,
-            weight_decay=weight_decay,
-            momentum=momentum,
-            nesterov=nesterov,
-            ns_steps=ns_steps,
-            eps=eps,
-            adjust_lr_fn=adjust_lr_fn,
-        )
-        super().__init__(params, defaults)
-
-    @torch.no_grad()
-    def step(self, closure: Any = None) -> Any:
-        loss = closure() if closure is not None else None
-        for group in self.param_groups:
-            lr, wd, beta = group["lr"], group["weight_decay"], group["momentum"]
-            for p in group["params"]:
-                if p.grad is None:
-                    continue
-                if p.ndim != 2:
-                    raise ValueError(f"Muon requires 2D weights, got shape {tuple(p.shape)}")
-                state = self.state[p]
-                buf = state.setdefault("momentum_buffer", torch.zeros_like(p.grad))
-                buf.lerp_(p.grad, 1.0 - beta)
-                update = p.grad.lerp(buf, beta) if group["nesterov"] else buf
-                ortho = _newtonschulz5(update, steps=group["ns_steps"], eps=group["eps"])
-
-                rows, cols = p.shape
-                scale = (
-                    0.2 * math.sqrt(max(rows, cols))
-                    if group["adjust_lr_fn"] == "match_rms_adamw"
-                    else math.sqrt(max(1.0, rows / max(cols, 1)))
-                )
-                if wd != 0.0:
-                    p.mul_(1.0 - lr * wd)
-                p.add_(ortho, alpha=-lr * scale)
-        return loss
 
 
 def _embedding_and_head_param_ids(model: nn.Module) -> set[int]:
@@ -132,17 +63,20 @@ def build_optimizers(model: nn.Module, cfg: Any) -> dict[str, torch.optim.Optimi
     optimizers: dict[str, torch.optim.Optimizer] = {}
 
     if cfg.optimizer_type == "muon_adamw" and muon_params:
-        muon_cls: Any = getattr(torch.optim, "Muon", FallbackMuon)
-        muon_kwargs: dict[str, Any] = {
-            "lr": cfg.muon_lr,
-            "weight_decay": cfg.muon_weight_decay,
-            "momentum": cfg.muon_momentum,
-            "nesterov": cfg.muon_nesterov,
-            "ns_steps": cfg.muon_ns_steps,
-        }
-        if "adjust_lr_fn" in inspect.signature(muon_cls.__init__).parameters and cfg.muon_adjust_lr_fn:
-            muon_kwargs["adjust_lr_fn"] = cfg.muon_adjust_lr_fn
-        opt_muon = muon_cls(muon_params, **muon_kwargs)
+        if not hasattr(torch.optim, "Muon"):
+            raise RuntimeError(
+                f"torch.optim.Muon requires PyTorch >= 2.9 (found {torch.__version__}). "
+                "Upgrade with `pip install -U torch` or set optimizer_type='adamw'."
+            )
+        opt_muon = torch.optim.Muon(
+            muon_params,
+            lr=cfg.muon_lr,
+            weight_decay=cfg.muon_weight_decay,
+            momentum=cfg.muon_momentum,
+            nesterov=cfg.muon_nesterov,
+            ns_steps=cfg.muon_ns_steps,
+            adjust_lr_fn=cfg.muon_adjust_lr_fn,  # None -> original Muon scaling (pair with lr ~0.02)
+        )
         for group in opt_muon.param_groups:
             group["base_lr"] = cfg.muon_lr
         optimizers["muon"] = opt_muon
