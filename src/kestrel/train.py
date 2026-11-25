@@ -37,7 +37,7 @@ import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from kestrel.tracking.mlflow_tracker import KestrelMLflowTracker, TrackingConfig
-from kestrel.utils.checkpoint import load_checkpoint, resolve_hf_repo_id, save_checkpoint, unwrap_model
+from kestrel.utils.checkpoint import load_checkpoint, save_checkpoint, unwrap_model
 from kestrel.utils.optim import apply_lr_schedule, build_optimizers, compute_lr_multiplier
 from kestrel.utils.text import get_gpt2_tokenizer
 
@@ -364,7 +364,7 @@ def train(cfg: TrainConfig, model: nn.Module | None = None) -> dict[str, Any]:
     # Tracking config: rank 0 only, inheriting hf_repo_id / blueprint / track from the model JSON
     tcfg = TrackingConfig(**asdict(cfg.tracking))
     tcfg.enabled = cfg.tracking.enabled and is_main
-    tcfg.hf_repo_id = resolve_hf_repo_id(tcfg.hf_repo_id, model_config=model_cfg)
+    tcfg.hf_repo_id = tcfg.hf_repo_id or model_cfg.get("hf_repo_id")
     if tcfg.blueprint == "custom" and isinstance(model_cfg.get("blueprint"), str):
         tcfg.blueprint = model_cfg["blueprint"]
     if isinstance(model_cfg.get("track"), str):
@@ -439,18 +439,15 @@ def train(cfg: TrainConfig, model: nn.Module | None = None) -> dict[str, Any]:
 
             if is_main and (step == 1 or step % cfg.log_interval == 0 or step == cfg.max_steps):
                 metrics = {
-                    **{f"train/{k}": v for k, v in acc.items()},
+                    **{f"train/{k}": v for k, v in acc.items() if k != "loss" or len(acc) > 2},
                     "train/ppl": math.exp(min(acc["lm"], 20.0)),
                     "train/grad_norm": grad_norm,
                     "perf/tokens_per_sec": throughputs[-1],
-                    "perf/step_ms": step_sec * 1000,
                     "progress/tokens_seen": float(tokens_seen),
                     "progress/gpu_hours": wall * world_size / 3600,
                     **lrs,
                     **hook_metrics,
                 }
-                if device.type == "cuda":
-                    metrics["perf/peak_vram_gb"] = torch.cuda.max_memory_allocated(device) / 1024**3
                 tracker.log_metrics(metrics, step=step)
                 print(
                     f"step {step:>5d}/{cfg.max_steps} | lm={acc['lm']:.4f} | ppl={metrics['train/ppl']:.2f} "
@@ -485,6 +482,7 @@ def train(cfg: TrainConfig, model: nn.Module | None = None) -> dict[str, Any]:
             "mean_tokens_per_sec": round(float(np.mean(throughputs)), 2) if throughputs else 0.0,
             "wall_clock_sec": round(wall, 2),
             "gpu_hours": round(wall * world_size / 3600, 6),
+            **({"peak_vram_gb": round(torch.cuda.max_memory_allocated(device) / 1024**3, 2)} if device.type == "cuda" else {}),
         }
 
         model_info = hub_info = snapshot_dir = None

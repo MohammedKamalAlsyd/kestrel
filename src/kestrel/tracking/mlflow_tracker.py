@@ -24,9 +24,7 @@ import torch
 import torch.nn as nn
 
 from kestrel.utils.checkpoint import (
-    count_model_parameters,
     push_checkpoint_to_hub,
-    resolve_hf_repo_id,
     unwrap_model,
 )
 
@@ -248,11 +246,13 @@ class KestrelMLflowTracker:
             self._mlflow.log_artifacts(str(p), artifact_path="configs")
 
     def log_model_summary(self, model: nn.Module) -> dict[str, int]:
-        """Compute and log total, non-embedding, and active parameter counts."""
-        self._param_counts = count_model_parameters(model)
+        """Compute and log unique total and active parameter counts."""
+        raw = unwrap_model(model)
+        total = sum(p.numel() for p in set(raw.parameters()))
+        active = int(raw.count_active_parameters()) if hasattr(raw, "count_active_parameters") else total
+        self._param_counts = {"total": total, "active": active}
         if self.enabled and self._mlflow is not None:
             self._mlflow.log_params({f"params.{k}": str(v) for k, v in self._param_counts.items()})
-            self._mlflow.log_metrics({f"params/{k}_millions": v / 1e6 for k, v in self._param_counts.items()}, step=0)
         return dict(self._param_counts)
 
     def log_metrics(self, metrics: dict[str, float], step: int | None = None) -> None:
@@ -329,11 +329,10 @@ class KestrelMLflowTracker:
         if not self.cfg.push_to_hub:
             return None
 
-        repo_id = resolve_hf_repo_id(self.cfg.hf_repo_id, model_config=model_config)
+        repo_id = (self.cfg.hf_repo_id or model_config.get("hf_repo_id") or "").strip()
         if not repo_id:
             raise ValueError(
-                "push_to_hub=True requires an HF repo ID (`--hf-repo-id`, `tracking.hf_repo_id`, "
-                "or `\"hf_repo_id\"` inside the model config JSON)."
+                "push_to_hub=True requires `tracking.hf_repo_id` or `\"hf_repo_id\"` in the model config JSON."
             )
 
         info = push_checkpoint_to_hub(

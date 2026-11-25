@@ -1,10 +1,8 @@
 """Shared utility helpers for Kestrel notebooks, optimizers, and checkpoints."""
 
 from kestrel.utils.checkpoint import (
-    count_model_parameters,
     load_checkpoint,
     push_checkpoint_to_hub,
-    resolve_hf_repo_id,
     save_checkpoint,
     unwrap_model,
 )
@@ -34,7 +32,6 @@ __all__ = [
     "compute_lr_multiplier",
     "configure_hf_cache",
     "count_gpt2_tokens",
-    "count_model_parameters",
     "find_repo_root",
     "get_gpt2_tokenizer",
     "get_hf_token",
@@ -43,7 +40,6 @@ __all__ = [
     "load_checkpoint",
     "normalize_words",
     "push_checkpoint_to_hub",
-    "resolve_hf_repo_id",
     "save_checkpoint",
     "unwrap_model",
 ]

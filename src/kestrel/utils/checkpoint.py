@@ -1,11 +1,10 @@
-"""Checkpoint I/O, parameter accounting, and Hugging Face Hub export utilities.
+"""Checkpoint I/O and Hugging Face Hub export utilities.
 
 Centralizes all model serialization logic in one place so `train.py` and `mlflow_tracker.py`
 stay small and focused:
 - `unwrap_model`: strips `torch.compile` and DDP/FSDP wrappers safely.
-- `count_model_parameters`: exact tied-weight-safe total, non-embedding, and active counts.
 - `save_checkpoint` / `load_checkpoint`: HF `save_pretrained()` weights + optimizer/RNG resume state.
-- `resolve_hf_repo_id` & `push_checkpoint_to_hub`: uploads checkpoints to per-model HF Hub repos.
+- `push_checkpoint_to_hub`: uploads checkpoints to per-model HF Hub repos.
 """
 
 from __future__ import annotations
@@ -32,60 +31,6 @@ def unwrap_model(model: nn.Module) -> nn.Module:
             cur = cur.module
         else:
             return cur
-
-
-def count_model_parameters(model: nn.Module) -> dict[str, int]:
-    """Compute unique parameter counts (total, trainable, embedding, non-embedding, active).
-
-    Deduplicates tensors by `id(p)` so tied input/output embeddings are never double-counted.
-    Track C MoE models can expose `count_active_parameters()` to report per-token active params.
-    """
-    raw = unwrap_model(model)
-    seen_all: set[int] = set()
-    total = 0
-    trainable = 0
-
-    for p in raw.parameters():
-        pid = id(p)
-        if pid in seen_all:
-            continue
-        seen_all.add(pid)
-        total += p.numel()
-        if p.requires_grad:
-            trainable += p.numel()
-
-    # Count unique input/output embedding parameters
-    seen_emb: set[int] = set()
-    emb_params = 0
-    for mod in raw.modules():
-        if isinstance(mod, nn.Embedding):
-            for p in mod.parameters(recurse=False):
-                if id(p) not in seen_emb:
-                    seen_emb.add(id(p))
-                    emb_params += p.numel()
-
-    if hasattr(raw, "get_output_embeddings"):
-        out_emb = raw.get_output_embeddings()
-        if isinstance(out_emb, nn.Module):
-            for p in out_emb.parameters(recurse=False):
-                if id(p) not in seen_emb:
-                    seen_emb.add(id(p))
-                    emb_params += p.numel()
-
-    non_emb = max(0, total - emb_params)
-    if hasattr(raw, "count_active_parameters") and callable(raw.count_active_parameters):
-        active = int(raw.count_active_parameters())
-    else:
-        active = total
-
-    return {
-        "total": total,
-        "trainable": trainable,
-        "embedding": emb_params,
-        "non_embedding": non_emb,
-        "active": active,
-        "non_embedding_active": max(0, active - emb_params),
-    }
 
 
 def save_checkpoint(
@@ -159,22 +104,6 @@ def load_checkpoint(
         int(state.get("tokens_seen", 0)),
         float(state.get("best_val_loss", float("inf"))),
     )
-
-
-def resolve_hf_repo_id(
-    override_repo_id: Any = None,
-    model_config: dict[str, Any] | None = None,
-) -> str | None:
-    """Resolve target HF Hub repo ID: CLI/config -> model_config['hf_repo_id'] -> ['hub_model_id']."""
-    explicit = getattr(override_repo_id, "hf_repo_id", override_repo_id)
-    for cand in (
-        explicit,
-        (model_config or {}).get("hf_repo_id"),
-        (model_config or {}).get("hub_model_id"),
-    ):
-        if isinstance(cand, str) and cand.strip():
-            return cand.strip()
-    return None
 
 
 def push_checkpoint_to_hub(
