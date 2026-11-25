@@ -14,7 +14,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-from kestrel.utils.checkpoint import unwrap_model
+from kestrel.utils.train.checkpoint import unwrap_model
 
 
 def _embedding_and_head_param_ids(model: nn.Module) -> set[int]:

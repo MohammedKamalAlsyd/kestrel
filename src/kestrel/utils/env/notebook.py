@@ -23,7 +23,7 @@ def find_repo_root(extra_candidates: Sequence[str | Path] | None = None) -> Path
     if extra_candidates:
         candidates.extend(Path(p) for p in extra_candidates)
 
-    module_root = Path(__file__).resolve().parents[3]
+    module_root = Path(__file__).resolve().parents[4]
     candidates.extend(
         [
             module_root,

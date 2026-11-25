@@ -18,7 +18,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-from kestrel.utils.notebook import get_hf_token
+from kestrel.utils.env.notebook import get_hf_token
 
 
 def unwrap_model(model: nn.Module) -> nn.Module:

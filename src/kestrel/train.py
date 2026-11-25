@@ -8,8 +8,9 @@ Run on Kaggle (1 or 2 GPUs) with everything driven by JSON configs plus optional
     torchrun --nproc_per_node=2 -m kestrel.train --train-config ... --model-config ...
 
 Related modules:
-- `kestrel.utils.optim`       Muon + AdamW and WSD / Cosine schedules
-- `kestrel.utils.checkpoint`  save / load / Hugging Face Hub publishing
+- `kestrel.config`            TrainConfig, TrackingConfig, model JSON loading, CLI overrides
+- `kestrel.utils.train`       device, dtype (bf16/fp16/fp32), DDP, seeds, Muon/AdamW, checkpoints
+- `kestrel.utils.data`        GPT-2 tokenization and text helpers
 - `kestrel.tracking`          DagsHub MLflow logging and GitHub run snapshots
 Training text is streamed from Hugging Face and tokenized on the fly (no disk downloads).
 """
@@ -18,13 +19,10 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import json
 import math
-import os
-import random
 import time
 from collections import defaultdict
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict
 from itertools import islice
 from pathlib import Path
 from typing import Any, Iterator
@@ -36,107 +34,30 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from kestrel.tracking.mlflow_tracker import KestrelMLflowTracker, TrackingConfig
-from kestrel.utils.checkpoint import load_checkpoint, save_checkpoint, unwrap_model
-from kestrel.utils.optim import apply_lr_schedule, build_optimizers, compute_lr_multiplier
-from kestrel.utils.text import get_gpt2_tokenizer
+from kestrel.config import (
+    TrackingConfig,
+    TrainConfig,
+    apply_overrides,
+    extract_model_metadata,
+    load_model_config,
+)
+from kestrel.tracking.mlflow_tracker import KestrelMLflowTracker
+from kestrel.utils.data import get_gpt2_tokenizer
+from kestrel.utils.train import (
+    apply_lr_schedule,
+    build_optimizers,
+    compute_lr_multiplier,
+    load_checkpoint,
+    save_checkpoint,
+    setup_runtime,
+    unwrap_model,
+)
 
 GPT2_EOT_TOKEN_ID = 50_256
 
 
 # ---------------------------------------------------------------------------
-# 1. Configuration (JSON file + `--set key=value` overrides)
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class TrainConfig:
-    """Training recipe shared by every Kestrel candidate. All fields can be set from JSON."""
-
-    model_config_path: str | None = None  # Path to a model config JSON (HF AutoConfig format)
-
-    # Streaming dataset & sequence packing
-    dataset_repo: str = "karpathy/climbmix-400b-shuffle"
-    dataset_config: str | None = None
-    dataset_split: str = "train"
-    text_field: str = "text"
-    shuffle_buffer_size: int = 2_048
-    seq_len: int = 2048
-    val_eval_batches: int = 16
-
-    # Batching & Muon (2D hidden weights) + AdamW (embeddings / heads / norms)
-    micro_batch_size: int = 4
-    grad_accum_steps: int = 8
-    max_steps: int = 1_000
-    optimizer_type: str = "muon_adamw"  # "muon_adamw" | "adamw"
-    muon_lr: float = 0.02
-    muon_momentum: float = 0.95
-    muon_nesterov: bool = True
-    muon_weight_decay: float = 0.01
-    muon_ns_steps: int = 5
-    muon_adjust_lr_fn: str | None = None  # None = original Muon scaling (pair with lr ~0.02)
-    adamw_lr: float = 3e-4
-    adamw_betas: tuple[float, float] = (0.9, 0.95)
-    adamw_eps: float = 1e-8
-    adamw_weight_decay: float = 0.1
-    max_grad_norm: float = 1.0
-
-    # LR schedule (WSD or Cosine)
-    lr_schedule: str = "wsd"
-    warmup_steps: int = 100
-    decay_steps: int = 100
-    wsd_decay_type: str = "cosine"  # "cosine" | "linear" | "sqrt"
-    min_lr_ratio: float = 0.1
-
-    # Auxiliary losses & precision (use "fp16" on Kaggle T4s: no native bf16)
-    z_loss_weight: float = 1e-4
-    aux_loss_weight: float = 1.0  # MoE balance term returned by the model (if any)
-    mtp_loss_weight: float = 0.3  # Multi-token-prediction term returned by the model (if any)
-    precision: str = "bf16"  # "bf16" | "fp16" | "fp32"
-
-    # Logging, checkpointing & tracking
-    log_interval: int = 10
-    eval_interval: int = 100
-    save_interval: int = 500
-    output_dir: str = "artifacts/checkpoints"
-    resume_from: str | None = None
-    seed: int = 42
-    tracking: TrackingConfig = field(default_factory=TrackingConfig)
-
-    @classmethod
-    def from_json(cls, path: str | Path) -> TrainConfig:
-        raw = json.loads(Path(path).read_text(encoding="utf-8"))
-        tracking = TrackingConfig(**(raw.pop("tracking", None) or {}))
-        if isinstance(raw.get("adamw_betas"), list):
-            raw["adamw_betas"] = tuple(raw["adamw_betas"])
-        return cls(**raw, tracking=tracking)
-
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
-
-
-def apply_overrides(cfg: TrainConfig, overrides: list[str]) -> TrainConfig:
-    """Apply `key=value` overrides; use dots for nested fields (e.g. `tracking.hf_repo_id=me/model`)."""
-    for item in overrides:
-        key, sep, raw = item.partition("=")
-        if not sep:
-            raise ValueError(f"Override must look like key=value, got '{item}'")
-        *parents, leaf = key.strip().split(".")
-        target: Any = cfg
-        for name in parents:
-            target = getattr(target, name)
-        if not hasattr(target, leaf):
-            raise KeyError(f"Unknown config field '{key}'")
-        try:
-            value = json.loads(raw)  # numbers, true/false, null, lists
-        except json.JSONDecodeError:
-            value = raw  # plain strings such as "owner/repo"
-        setattr(target, leaf, value)
-    return cfg
-
-
-# ---------------------------------------------------------------------------
-# 2. Streaming data: HF text -> GPT-2 tokens -> packed (input, label, document_id) windows
+# 1. Streaming data: HF text -> GPT-2 tokens -> packed (input, label, document_id) windows
 # ---------------------------------------------------------------------------
 
 
@@ -204,7 +125,7 @@ def stream_packed_batches(
 
 
 # ---------------------------------------------------------------------------
-# 3. Model loading, unified loss, eval, and post-step hooks
+# 2. Model loading, unified loss, eval, and post-step hooks
 # ---------------------------------------------------------------------------
 
 
@@ -215,14 +136,13 @@ def build_model_from_config(cfg: TrainConfig) -> tuple[nn.Module, dict[str, Any]
     if not cfg.model_config_path:
         raise ValueError("Set `model_config_path` (or `--model-config`), or pass a pre-built model to train().")
 
-    raw = json.loads(Path(cfg.model_config_path).read_text(encoding="utf-8"))
+    raw = load_model_config(cfg.model_config_path)
     hf_cfg = AutoConfig.from_pretrained(cfg.model_config_path, trust_remote_code=True)
     model = AutoModelForCausalLM.from_config(hf_cfg, trust_remote_code=True)
 
     model_cfg = hf_cfg.to_dict()
-    for key in ("hf_repo_id", "hub_model_id", "blueprint", "track"):  # Kestrel metadata fields
-        if key in raw:
-            model_cfg.setdefault(key, raw[key])
+    for key, val in extract_model_metadata(raw).items():
+        model_cfg.setdefault(key, val)
     return model, model_cfg
 
 
@@ -300,50 +220,16 @@ def _evaluate(model, val_batches, cfg, device, autocast_ctx, world_size) -> tupl
 
 
 # ---------------------------------------------------------------------------
-# 4. Runtime setup (DDP via torchrun, seeds, mixed precision)
-# ---------------------------------------------------------------------------
-
-
-def _setup_runtime(seed: int, precision: str):
-    """Return `(rank, world_size, local_rank, device, autocast_ctx, grad_scaler_or_None)`."""
-    rank, world_size, local_rank = 0, 1, 0
-    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:  # launched with torchrun
-        rank, world_size = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        if not dist.is_initialized():
-            dist.init_process_group(backend="nccl" if torch.cuda.is_available() else "gloo")
-
-    if torch.cuda.is_available():
-        device = torch.device(f"cuda:{local_rank}")
-        torch.cuda.set_device(device)
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-    else:
-        device = torch.device("cpu")
-
-    random.seed(seed + rank)
-    np.random.seed(seed + rank)
-    torch.manual_seed(seed + rank)
-    if device.type == "cuda":
-        torch.cuda.manual_seed_all(seed + rank)
-
-    if device.type != "cuda" or precision == "fp32":
-        return rank, world_size, local_rank, device, contextlib.nullcontext, None
-    if precision == "bf16" and torch.cuda.is_bf16_supported():
-        return rank, world_size, local_rank, device, (lambda: torch.amp.autocast("cuda", dtype=torch.bfloat16)), None
-    scaler = torch.amp.GradScaler("cuda", enabled=True)  # fp16 needs loss scaling (e.g. Kaggle T4)
-    return rank, world_size, local_rank, device, (lambda: torch.amp.autocast("cuda", dtype=torch.float16)), scaler
-
-
-# ---------------------------------------------------------------------------
-# 5. Training loop
+# 3. Training loop (runtime initialized via `kestrel.utils.train`)
 # ---------------------------------------------------------------------------
 
 
 def train(cfg: TrainConfig, model: nn.Module | None = None) -> dict[str, Any]:
     """Run pretraining; log to DagsHub MLflow, save checkpoints, and optionally push to HF Hub."""
-    rank, world_size, local_rank, device, autocast_ctx, scaler = _setup_runtime(cfg.seed, cfg.precision)
-    is_main = rank == 0
+    runtime = setup_runtime(seed=cfg.seed, precision=cfg.precision)
+    rank, world_size, local_rank = runtime.rank, runtime.world_size, runtime.local_rank
+    device, autocast_ctx, scaler = runtime.device, runtime.autocast, runtime.scaler
+    is_main = runtime.is_main
 
     # Model (+ metadata such as hf_repo_id / blueprint / track read from the model JSON)
     model, model_cfg = build_model_from_config(cfg) if model is None else (model, None)
@@ -390,7 +276,7 @@ def train(cfg: TrainConfig, model: nn.Module | None = None) -> dict[str, Any]:
 
         if is_main:
             print(
-                f"[kestrel.train] Run={tracker.run_name} | Device={device} x{world_size} | "
+                f"[kestrel.train] Run={tracker.run_name} | {runtime.summary()} | "
                 f"Params={params['total']/1e6:.2f}M (active={params['active']/1e6:.2f}M) | "
                 f"Opt={list(optimizers)} | Tok/step={tokens_per_step:,}"
             )
@@ -516,7 +402,7 @@ def train(cfg: TrainConfig, model: nn.Module | None = None) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# 6. CLI
+# 5. CLI
 # ---------------------------------------------------------------------------
 
 

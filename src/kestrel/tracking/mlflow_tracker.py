@@ -2,7 +2,7 @@
 
 Logs directly to DagsHub hosted MLflow (`https://dagshub.com/<owner>/<repo>.mlflow`) or any
 `MLFLOW_TRACKING_URI` (no local server daemon or manual syncing needed). Checkpoint I/O and
-Hugging Face Hub uploads are handled by `kestrel.utils.checkpoint`.
+Hugging Face Hub uploads are handled by `kestrel.utils.train.checkpoint`.
 """
 
 from __future__ import annotations
@@ -15,7 +15,6 @@ import os
 import platform
 import subprocess
 import tempfile
-from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -23,43 +22,13 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-from kestrel.utils.checkpoint import (
+from kestrel.config.tracking import DEFAULT_EXPERIMENT_NAME, TrackingConfig
+from kestrel.utils.train.checkpoint import (
     push_checkpoint_to_hub,
     unwrap_model,
 )
 
-DEFAULT_EXPERIMENT_NAME = "kestrel"
 MAX_MLFLOW_PARAM_LEN = 500
-
-
-@dataclass
-class TrackingConfig:
-    """Configuration for DagsHub/MLflow tracking, HF Hub checkpoints, and GitHub snapshots."""
-
-    enabled: bool = True
-    dagshub_repo: str | None = None  # "owner/repo" -> https://dagshub.com/<owner>/<repo>.mlflow
-    tracking_uri: str | None = None  # Explicit MLflow URI override (or MLFLOW_TRACKING_URI env)
-    experiment_name: str = DEFAULT_EXPERIMENT_NAME
-    run_name: str | None = None
-    stage: str = "stage1_ablation"
-    track: str = "track_a_dense"
-    blueprint: str = "custom"
-    tags: dict[str, str] = field(default_factory=dict)
-
-    # Model destinations (recommended: log_model_to_mlflow=False + push_to_hub=True)
-    log_model_to_mlflow: bool = False
-    log_hf_checkpoint_artifact: bool = False
-    registered_model_name: str | None = None
-    push_to_hub: bool = False
-    hf_repo_id: str | None = None  # Falls back to model_config["hf_repo_id"|"hub_model_id"]
-    hf_revision: str | None = None
-    hf_private: bool = False
-    hf_path_in_repo: str | None = None
-
-    # Lightweight GitHub-browsable run receipt (zero weights)
-    export_github_snapshot: bool = True
-    experiments_dir: str = "experiments"
-    storage_dir: str = "artifacts/mlflow"  # Offline SQLite fallback when no remote URI is set
 
 
 def configure_dagshub_tracking(dagshub_repo: str | None = None, token: str | None = None) -> str | None:
@@ -325,7 +294,7 @@ class KestrelMLflowTracker:
         final_metrics: dict[str, Any],
         hf_checkpoint_dir: str | Path | None = None,
     ) -> dict[str, str] | None:
-        """Push checkpoint to Hugging Face Hub via `kestrel.utils.checkpoint` and tag MLflow run."""
+        """Push checkpoint to Hugging Face Hub via `kestrel.utils.train.checkpoint` and tag MLflow run."""
         if not self.cfg.push_to_hub:
             return None
 

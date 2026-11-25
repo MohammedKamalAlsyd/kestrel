@@ -1,45 +1,79 @@
-"""Shared utility helpers for Kestrel notebooks, optimizers, and checkpoints."""
+"""Shared utility subpackages (`train`, `data`, `env`) for Kestrel."""
 
-from kestrel.utils.checkpoint import (
-    load_checkpoint,
-    push_checkpoint_to_hub,
-    save_checkpoint,
-    unwrap_model,
+from kestrel.utils import data, env, train
+from kestrel.utils.data import (
+    WORD_RE,
+    count_gpt2_tokens,
+    get_gpt2_tokenizer,
+    normalize_words,
 )
-from kestrel.utils.notebook import (
+from kestrel.utils.env import (
     configure_hf_cache,
     find_repo_root,
     get_hf_token,
     get_work_dir,
     is_kaggle,
 )
-from kestrel.utils.optim import (
+from kestrel.utils.train import (
+    RuntimeEnv,
     apply_lr_schedule,
     build_optimizers,
+    cleanup_distributed,
     compute_lr_multiplier,
-)
-from kestrel.utils.text import (
-    WORD_RE,
-    count_gpt2_tokens,
-    get_gpt2_tokenizer,
-    normalize_words,
+    configure_device_backends,
+    get_device_info,
+    get_dtype,
+    is_bf16_supported,
+    is_dtype_supported,
+    is_fp16_supported,
+    is_mps_available,
+    load_checkpoint,
+    make_autocast_context,
+    make_grad_scaler,
+    push_checkpoint_to_hub,
+    resolve_device,
+    resolve_dtype,
+    save_checkpoint,
+    seed_everything,
+    setup_distributed,
+    setup_runtime,
+    unwrap_model,
 )
 
 __all__ = [
+    "RuntimeEnv",
     "WORD_RE",
     "apply_lr_schedule",
     "build_optimizers",
+    "cleanup_distributed",
     "compute_lr_multiplier",
+    "configure_device_backends",
     "configure_hf_cache",
     "count_gpt2_tokens",
+    "data",
+    "env",
     "find_repo_root",
+    "get_device_info",
+    "get_dtype",
     "get_gpt2_tokenizer",
     "get_hf_token",
     "get_work_dir",
+    "is_bf16_supported",
+    "is_dtype_supported",
+    "is_fp16_supported",
     "is_kaggle",
+    "is_mps_available",
     "load_checkpoint",
+    "make_autocast_context",
+    "make_grad_scaler",
     "normalize_words",
     "push_checkpoint_to_hub",
+    "resolve_device",
+    "resolve_dtype",
     "save_checkpoint",
+    "seed_everything",
+    "setup_distributed",
+    "setup_runtime",
+    "train",
     "unwrap_model",
 ]
