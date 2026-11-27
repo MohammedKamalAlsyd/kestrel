@@ -60,7 +60,8 @@ class TrainConfig:
     prefetch_batches: int = 4  # Background thread prefetch depth (0 disables async prefetch)
 
     # Logging, checkpointing, capacity/plateau metrics & tracking
-    log_interval: int = 10
+    log_interval: int = 25
+    print_interval: int | None = None  # Defaults to log_interval; set larger in notebooks to keep stdout compact
     eval_interval: int = 100
     save_interval: int = 500
     track_capacity_metrics: bool = True

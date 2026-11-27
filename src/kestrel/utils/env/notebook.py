@@ -29,6 +29,7 @@ def find_repo_root(extra_candidates: Sequence[str | Path] | None = None) -> Path
             module_root,
             Path.cwd(),
             Path.cwd().parent,
+            get_work_dir() / "kestrel_repo",
             get_work_dir() / "kestrel",
             Path("/kaggle/input/kestrel"),
         ]

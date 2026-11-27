@@ -58,6 +58,7 @@ from kestrel.utils.data import get_gpt2_tokenizer
 from kestrel.utils.train import (
     apply_lr_schedule,
     build_optimizers,
+    cleanup_distributed,
     compute_lr_multiplier,
     load_checkpoint,
     save_checkpoint,
@@ -383,6 +384,14 @@ def _evaluate(model, val_batches, cfg, device, autocast_ctx, world_size) -> tupl
 def train(cfg: TrainConfig, model: nn.Module | None = None) -> dict[str, Any]:
     """Run pretraining; log to DagsHub MLflow, save checkpoints, and optionally push to HF Hub."""
     runtime = setup_runtime(seed=cfg.seed, precision=cfg.precision)
+    try:
+        return _train_inner(cfg, runtime, model=model)
+    finally:
+        if runtime.is_distributed:
+            cleanup_distributed()
+
+
+def _train_inner(cfg: TrainConfig, runtime: Any, model: nn.Module | None = None) -> dict[str, Any]:
     rank, world_size, local_rank = runtime.rank, runtime.world_size, runtime.local_rank
     device, autocast_ctx, scaler = runtime.device, runtime.autocast, runtime.scaler
     is_main = runtime.is_main
@@ -513,10 +522,12 @@ def train(cfg: TrainConfig, model: nn.Module | None = None) -> dict[str, Any]:
                     **grad_health,
                 }
                 tracker.log_metrics(metrics, step=step)
-                print(
-                    f"step {step:>5d}/{cfg.max_steps} | lm={acc['lm']:.4f} | ppl={metrics['train/ppl']:.2f} "
-                    f"| gnorm={grad_norm:.2f} | tok/s={throughputs[-1]:,.0f} | seen={tokens_seen:,}"
-                )
+                print_every = cfg.print_interval if cfg.print_interval is not None else cfg.log_interval
+                if step == 1 or step % max(1, print_every) == 0 or step == cfg.max_steps:
+                    print(
+                        f"step {step:>5d}/{cfg.max_steps} | lm={acc['lm']:.3f} | ppl={metrics['train/ppl']:.1f} "
+                        f"| gnorm={grad_norm:.2f} | tok/s={throughputs[-1]:,.0f} | tok={tokens_seen/1e6:.2f}M"
+                    )
 
             if cfg.eval_interval > 0 and val_batches and (step % cfg.eval_interval == 0 or step == cfg.max_steps):
                 val_loss, val_ppl, extra_eval = _evaluate(model, val_batches, cfg, device, autocast_ctx, world_size)

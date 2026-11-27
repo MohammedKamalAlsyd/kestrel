@@ -15,6 +15,7 @@ import os
 import platform
 import subprocess
 import tempfile
+import warnings
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -32,7 +33,11 @@ MAX_MLFLOW_PARAM_LEN = 500
 
 
 def configure_dagshub_tracking(dagshub_repo: str | None = None, token: str | None = None) -> str | None:
-    """Wire DagsHub MLflow env credentials (`DAGSHUB_TOKEN`) and return the tracking URI."""
+    """Wire DagsHub MLflow env credentials (`DAGSHUB_TOKEN`) and return the tracking URI.
+
+    Returns `None` (falling back to offline SQLite) when no DagsHub auth token is available,
+    preventing unauthenticated HTTP 403 errors on `/mlflow/experiments/create`.
+    """
     repo = (dagshub_repo or os.environ.get("DAGSHUB_REPO") or "").strip()
     if not repo:
         owner = os.environ.get("DAGSHUB_REPO_OWNER", "").strip()
@@ -40,18 +45,32 @@ def configure_dagshub_tracking(dagshub_repo: str | None = None, token: str | Non
         if owner and name:
             repo = f"{owner}/{name}"
 
-    auth_token = (token or os.environ.get("DAGSHUB_TOKEN") or os.environ.get("DAGSHUB_USER_TOKEN") or "").strip()
-    if auth_token and not os.environ.get("MLFLOW_TRACKING_PASSWORD"):
+    auth_token = (
+        token
+        or os.environ.get("DAGSHUB_TOKEN")
+        or os.environ.get("DAGSHUB_USER_TOKEN")
+        or os.environ.get("MLFLOW_TRACKING_PASSWORD")
+        or ""
+    ).strip()
+    if auth_token:
         os.environ["MLFLOW_TRACKING_PASSWORD"] = auth_token
 
     if not repo:
         return None
     if "/" not in repo:
         raise ValueError(f"Expected DagsHub repo in 'owner/repo' format, got '{repo}'")
+    if not auth_token:
+        warnings.warn(
+            f"DagsHub repo '{repo}' is configured but DAGSHUB_TOKEN is missing; "
+            "falling back to local offline SQLite MLflow tracking.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return None
 
     owner, repo_name = repo.split("/", 1)
-    if not os.environ.get("MLFLOW_TRACKING_USERNAME"):
-        os.environ["MLFLOW_TRACKING_USERNAME"] = os.environ.get("DAGSHUB_USERNAME", owner)
+    username = (os.environ.get("MLFLOW_TRACKING_USERNAME") or os.environ.get("DAGSHUB_USERNAME") or owner).strip()
+    os.environ["MLFLOW_TRACKING_USERNAME"] = username
     return f"https://dagshub.com/{owner}/{repo_name}.mlflow"
 
 
@@ -78,18 +97,30 @@ def ensure_experiment(
 ) -> str:
     """Create or retrieve the MLflow experiment on the active tracking server."""
     import mlflow
+    from mlflow.exceptions import MlflowException
 
     mlflow.set_tracking_uri(tracking_uri)
-    existing = mlflow.get_experiment_by_name(experiment_name)
-    if existing is not None:
-        return str(existing.experiment_id)
-    return str(
-        mlflow.create_experiment(
-            name=experiment_name,
-            artifact_location=artifact_location,
-            tags={"project": "kestrel"},
+    try:
+        existing = mlflow.get_experiment_by_name(experiment_name)
+        if existing is not None:
+            return str(existing.experiment_id)
+        return str(
+            mlflow.create_experiment(
+                name=experiment_name,
+                artifact_location=artifact_location,
+                tags={"project": "kestrel"},
+            )
         )
-    )
+    except MlflowException as exc:
+        if any(code in str(exc) for code in ("403", "404")) and "dagshub.com" in tracking_uri:
+            user = os.environ.get("MLFLOW_TRACKING_USERNAME", "<unset>")
+            raise MlflowException(
+                f"DagsHub returned HTTP 403/404 for '{tracking_uri}' (username='{user}'). "
+                "Verify that: (1) the repo exists at that exact URL on dagshub.com, "
+                "(2) DAGSHUB_USERNAME matches your DagsHub account, and (3) DAGSHUB_TOKEN is valid. "
+                "Or set tracking.dagshub_repo=null to log locally to SQLite."
+            ) from exc
+        raise
 
 
 def flatten_dict(data: dict[str, Any], prefix: str = "", sep: str = ".") -> dict[str, str]:
@@ -172,11 +203,30 @@ class KestrelMLflowTracker:
             art_dir.mkdir(parents=True, exist_ok=True)
             artifact_loc = art_dir.as_uri()
 
-        self.experiment_id = ensure_experiment(
-            self.tracking_uri,
-            experiment_name=self.cfg.experiment_name,
-            artifact_location=artifact_loc,
-        )
+        try:
+            self.experiment_id = ensure_experiment(
+                self.tracking_uri,
+                experiment_name=self.cfg.experiment_name,
+                artifact_location=artifact_loc,
+            )
+        except Exception as exc:
+            if "dagshub.com" not in self.tracking_uri:
+                raise
+            warnings.warn(
+                f"Remote DagsHub MLflow failed ({exc}); falling back to local SQLite so training can continue.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            root = Path(self.cfg.storage_dir).resolve()
+            root.mkdir(parents=True, exist_ok=True)
+            self.tracking_uri = f"sqlite:///{(root / 'mlflow.db').as_posix()}"
+            art_dir = root / "artifacts"
+            art_dir.mkdir(parents=True, exist_ok=True)
+            self.experiment_id = ensure_experiment(
+                self.tracking_uri,
+                experiment_name=self.cfg.experiment_name,
+                artifact_location=art_dir.as_uri(),
+            )
         mlflow.set_experiment(self.cfg.experiment_name)
 
         self._git_info = _git_provenance()

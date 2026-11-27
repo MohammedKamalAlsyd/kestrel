@@ -28,6 +28,9 @@ def _shrink_config_for_local(raw: dict[str, Any], *, full_size: bool = False) ->
     cfg.update(
         {
             "vocab_size": 256,
+            "bos_token_id": 0,
+            "eos_token_id": 0,
+            "pad_token_id": 0,
             "max_position_embeddings": 128,
             "num_hidden_layers": min(4, int(cfg.get("num_hidden_layers", 4))),
             "hidden_size": 128,
